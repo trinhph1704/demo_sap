@@ -1,0 +1,21 @@
+REPORT ysap03_dynamic_z_table.
+
+INCLUDE ysap03_dynamic_z_table_t01.
+INCLUDE ysap03_dynamic_z_table_c00.
+INCLUDE ysap03_dynamic_z_table_f00.
+INCLUDE ysap03_dynamic_z_table_f01.
+INCLUDE ysap03_dynamic_z_table_o01.
+INCLUDE ysap03_dynamic_z_table_i01.
+
+INITIALIZATION.
+  PERFORM init_program.
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_table.
+  PERFORM show_z_table_help.
+
+AT SELECTION-SCREEN.
+  PERFORM validate_table_name.
+
+START-OF-SELECTION.
+  PERFORM load_table_data.
+  CALL SCREEN 100.

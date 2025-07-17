@@ -1,0 +1,529 @@
+*&---------------------------------------------------------------------*
+*& Include          YSAP03_DYNAMIC_Z_TABLE_C00
+*&---------------------------------------------------------------------*
+
+CLASS zcl_table_manager IMPLEMENTATION.
+  METHOD constructor.
+  ENDMETHOD.
+
+  METHOD get_table_structure.
+    CHECK NOT iv_tabname IS INITIAL.
+
+    SELECT tabname, fieldname, keyflag, as4vers
+      FROM dd03l
+      INTO TABLE @DATA(lt_dd03l)
+      WHERE tabname = @iv_tabname
+        AND as4vers = '0000'
+        AND keyflag = 'X'.
+
+    CALL FUNCTION 'LVC_FIELDCATALOG_MERGE'
+      EXPORTING
+        i_structure_name = iv_tabname
+      CHANGING
+        ct_fieldcat      = rt_fcat.
+
+    LOOP AT rt_fcat ASSIGNING FIELD-SYMBOL(<ls_fcat>).
+      READ TABLE lt_dd03l TRANSPORTING NO FIELDS
+        WITH KEY tabname = iv_tabname
+                 fieldname = <ls_fcat>-fieldname
+                 keyflag = 'X'.
+
+      CHECK sy-subrc = 0 OR <ls_fcat>-fieldname = 'MANDT'.
+
+      <ls_fcat>-key = abap_true.
+      <ls_fcat>-edit = abap_false.
+      <ls_fcat>-emphasize = 'C110'.
+      <ls_fcat>-scrtext_s = |[PK]{ <ls_fcat>-scrtext_s }|.
+      <ls_fcat>-scrtext_m = |[PK]{ <ls_fcat>-scrtext_m }|.
+      <ls_fcat>-scrtext_l = |[PK]{ <ls_fcat>-scrtext_l }|.
+    ENDLOOP.
+  ENDMETHOD.
+
+  METHOD get_table_data.
+    TRY.
+        CREATE DATA rr_data TYPE STANDARD TABLE OF (iv_tabname).
+        ASSIGN rr_data->* TO FIELD-SYMBOL(<lt_data>).
+        CHECK <lt_data> IS ASSIGNED.
+
+        " Load data without ORDER BY to preserve insertion order
+        " This prevents new rows from being repositioned after save/reload
+        SELECT * FROM (iv_tabname) INTO TABLE @<lt_data>.
+
+      CATCH cx_sy_dyn_call_illegal_type cx_sy_create_data_error.
+        CLEAR rr_data.
+    ENDTRY.
+  ENDMETHOD.
+
+  METHOD update_table_data.
+    ASSIGN ir_data->* TO FIELD-SYMBOL(<lt_data>).
+    CHECK <lt_data> IS ASSIGNED.
+    MODIFY (iv_tabname) FROM TABLE @<lt_data>.
+    rv_success = COND #( WHEN sy-subrc = 0 THEN abap_true ELSE abap_false ).
+  ENDMETHOD.
+
+  METHOD delete_table_data.
+    FIELD-SYMBOLS: <lt_data>           TYPE ANY TABLE,
+                   <lt_data_to_delete> TYPE ANY TABLE.
+
+    ASSIGN ir_data->* TO <lt_data>.
+    CHECK <lt_data> IS ASSIGNED.
+
+    DATA(lt_sorted_keys) = it_keys.
+    SORT lt_sorted_keys DESCENDING.
+
+    DATA: lo_data_to_delete TYPE REF TO data.
+    CREATE DATA lo_data_to_delete LIKE <lt_data>.
+    ASSIGN lo_data_to_delete->* TO <lt_data_to_delete>.
+    CHECK <lt_data_to_delete> IS ASSIGNED.
+
+    DATA: lv_current_index TYPE i.
+    LOOP AT <lt_data> ASSIGNING FIELD-SYMBOL(<ls_line>).
+      lv_current_index = lv_current_index + 1.
+      READ TABLE lt_sorted_keys TRANSPORTING NO FIELDS WITH KEY table_line = lv_current_index.
+      CHECK sy-subrc = 0.
+      INSERT <ls_line> INTO TABLE <lt_data_to_delete>.
+    ENDLOOP.
+
+    CHECK <lt_data_to_delete> IS NOT INITIAL.
+    DELETE (iv_tabname) FROM TABLE @<lt_data_to_delete>.
+    rv_success = COND #( WHEN sy-subrc = 0 THEN abap_true ELSE abap_false ).
+
+    IF rv_success = abap_true.
+      DATA: lt_temp_data   TYPE REF TO data, lv_row_counter TYPE i.
+      FIELD-SYMBOLS: <lt_temp> TYPE table.
+
+      CREATE DATA lt_temp_data LIKE <lt_data>.
+      ASSIGN lt_temp_data->* TO <lt_temp>.
+      CHECK <lt_temp> IS ASSIGNED.
+
+      LOOP AT <lt_data> ASSIGNING <ls_line>.
+        lv_row_counter = lv_row_counter + 1.
+        READ TABLE lt_sorted_keys TRANSPORTING NO FIELDS WITH KEY table_line = lv_row_counter.
+        CHECK sy-subrc <> 0.
+        INSERT <ls_line> INTO TABLE <lt_temp>.
+      ENDLOOP.
+
+      <lt_data> = <lt_temp>.
+    ENDIF.
+  ENDMETHOD.
+
+  METHOD create_table_data.
+    ASSIGN ir_data->* TO FIELD-SYMBOL(<lt_data>).
+    CHECK <lt_data> IS ASSIGNED.
+
+    LOOP AT <lt_data> ASSIGNING FIELD-SYMBOL(<ls_line>).
+      INSERT (iv_tabname) FROM <ls_line>.
+    ENDLOOP.
+
+    rv_success = abap_true.
+  ENDMETHOD.
+ENDCLASS.
+
+CLASS zcl_table_event_handler IMPLEMENTATION.
+  METHOD handle_toolbar.
+    APPEND VALUE #( function = 'EDIT'
+                    icon = icon_change
+                    quickinfo = 'Switch edit mode'
+                    text = COND #( WHEN gv_mode = c_mode_display
+                                  THEN 'Edit' ELSE 'View' ) ) TO e_object->mt_toolbar.
+
+    CASE gv_mode.
+      WHEN c_mode_display OR c_mode_edit OR c_mode_create.
+        APPEND VALUE #( function = 'HISTORY_VERSIONS'
+                        icon = icon_history
+                        text = 'Version History'
+                        quickinfo = 'View version history' ) TO e_object->mt_toolbar.
+    ENDCASE.
+
+    CHECK gv_mode = c_mode_edit OR gv_mode = c_mode_create.
+
+    APPEND VALUE #( function = 'CREATE'
+                    icon = icon_create
+                    text = 'Create'
+                    quickinfo = 'Add new line' ) TO e_object->mt_toolbar.
+
+    APPEND VALUE #( function = 'DELETE'
+                    icon = icon_delete
+                    text = 'Delete'
+                    quickinfo = 'Delete selected rows' ) TO e_object->mt_toolbar.
+
+    APPEND VALUE #( function = 'UPLOAD_DATA_TO_TABLE'
+                    icon = icon_import
+                    text = 'Upload'
+                    quickinfo = 'Upload Excel to Table' ) TO e_object->mt_toolbar.
+
+    APPEND VALUE #( function = 'DOWNLOAD_DATA_TO_EXCEL'
+                    icon = icon_export
+                    text = 'Export'
+                    quickinfo = 'Export Data to Excel' ) TO e_object->mt_toolbar.
+
+    APPEND VALUE #( function = 'DOWNLOAD_TEMPLATE'
+                    icon = icon_export
+                    text = 'Export Template'
+                    quickinfo = 'DOWNLOAD_EXCEL_TEMPLATE' ) TO e_object->mt_toolbar.
+  ENDMETHOD.
+
+  METHOD handle_user_command.
+    CASE e_ucomm.
+      WHEN 'EDIT'.
+        PERFORM enter_edit_mode.
+      WHEN 'CREATE'.
+        PERFORM enter_create_mode.
+      WHEN 'DELETE'.
+        PERFORM delete_data.
+      WHEN 'UPLOAD_DATA_TO_TABLE'.
+        PERFORM upload_data_from_excel.
+      WHEN 'DOWNLOAD_TEMPLATE'.
+        PERFORM download_excel_template USING p_table.
+      WHEN 'DOWNLOAD_DATA_TO_EXCEL'.
+        PERFORM download_data_to_excel USING p_table.
+      WHEN 'HISTORY_VERSIONS'.
+        CALL SCREEN 200.
+    ENDCASE.
+  ENDMETHOD.
+
+  METHOD check_key_duplicate.
+    FIELD-SYMBOLS: <lt_alv> TYPE STANDARD TABLE,
+                   <ls_row> TYPE any,
+                   <lv_val> TYPE any.
+
+    rv_is_duplicate = abap_false.
+
+    " Get ALV data and current row
+    ASSIGN gt_alv_data->* TO <lt_alv>.
+    CHECK <lt_alv> IS ASSIGNED.
+
+    READ TABLE <lt_alv> ASSIGNING <ls_row> INDEX iv_row_id.
+    CHECK sy-subrc = 0.
+
+    " Check if current row is new
+    ASSIGN COMPONENT 'IS_NEW' OF STRUCTURE <ls_row> TO FIELD-SYMBOL(<lv_current_new>).
+    DATA(lv_current_is_new) = COND abap_bool( WHEN <lv_current_new> IS ASSIGNED AND <lv_current_new> = 'X' THEN abap_true ELSE abap_false ).
+
+    " Build current row key values
+    DATA: lt_current_keys TYPE TABLE OF string.
+    LOOP AT it_key_fcat INTO DATA(ls_key_fcat).
+      READ TABLE it_mod_values ASSIGNING FIELD-SYMBOL(<ls_mod>)
+        WITH KEY row_id = iv_row_id fieldname = ls_key_fcat-fieldname.
+      IF sy-subrc = 0.
+        APPEND to_upper( |{ <ls_mod>-value }| ) TO lt_current_keys.
+      ELSE.
+        ASSIGN COMPONENT ls_key_fcat-fieldname OF STRUCTURE <ls_row> TO <lv_val>.
+        APPEND to_upper( |{ <lv_val> }| ) TO lt_current_keys.
+      ENDIF.
+    ENDLOOP.
+
+    " For new rows, check against all existing rows (not just new ones)
+    IF lv_current_is_new = abap_true.
+      LOOP AT <lt_alv> ASSIGNING FIELD-SYMBOL(<ls_other_row>).
+        " Skip self-comparison
+        CHECK sy-tabix <> iv_row_id.
+
+        ASSIGN COMPONENT 'IS_DELETED' OF STRUCTURE <ls_other_row> TO FIELD-SYMBOL(<lv_other_deleted>).
+        CHECK <lv_other_deleted> IS NOT ASSIGNED OR <lv_other_deleted> <> 'X'.
+
+        " Build other row key
+        DATA: lt_other_keys TYPE TABLE OF string.
+        CLEAR lt_other_keys.
+        LOOP AT it_key_fcat INTO ls_key_fcat.
+          ASSIGN COMPONENT ls_key_fcat-fieldname OF STRUCTURE <ls_other_row> TO <lv_val>.
+          APPEND to_upper( |{ <lv_val> }| ) TO lt_other_keys.
+        ENDLOOP.
+
+        IF lt_current_keys = lt_other_keys.
+          rv_is_duplicate = abap_true.
+          RETURN.
+        ENDIF.
+      ENDLOOP.
+
+      rv_is_duplicate = abap_false.
+    ELSE.
+      " For non-new rows, use original logic
+      LOOP AT <lt_alv> ASSIGNING <ls_other_row>.
+        CHECK sy-tabix <> iv_row_id.
+        ASSIGN COMPONENT 'IS_DELETED' OF STRUCTURE <ls_other_row> TO <lv_other_deleted>.
+        CHECK <lv_other_deleted> IS NOT ASSIGNED OR <lv_other_deleted> <> 'X'.
+
+        " Build other row key
+        DATA: lt_other_keys_orig TYPE TABLE OF string.
+        CLEAR lt_other_keys_orig.
+        LOOP AT it_key_fcat INTO ls_key_fcat.
+          ASSIGN COMPONENT ls_key_fcat-fieldname OF STRUCTURE <ls_other_row> TO <lv_val>.
+          APPEND to_upper( |{ <lv_val> }| ) TO lt_other_keys_orig.
+        ENDLOOP.
+
+        IF lt_current_keys = lt_other_keys_orig.
+          rv_is_duplicate = abap_true.
+          RETURN.
+        ENDIF.
+      ENDLOOP.
+    ENDIF.
+  ENDMETHOD.
+
+  METHOD revalidate_all_new_rows.
+    DATA: lt_key_fcat TYPE lvc_t_fcat,
+          ls_key_fcat TYPE lvc_s_fcat.
+
+    FIELD-SYMBOLS: <lt_alv>       TYPE STANDARD TABLE,
+                   <ls_row>       TYPE any,
+                   <lv_val>       TYPE any,
+                   <lv_new_flag>  TYPE any,
+                   <lv_err_flag>  TYPE any,
+                   <lv_del_flag>  TYPE any,
+                   <lv_row_color> TYPE any.
+
+    " Get key field catalog
+    LOOP AT gt_fieldcat INTO ls_key_fcat WHERE key = abap_true AND fieldname <> 'MANDT'.
+      APPEND ls_key_fcat TO lt_key_fcat.
+    ENDLOOP.
+    CHECK lt_key_fcat IS NOT INITIAL.
+
+    " Get ALV data
+    ASSIGN gt_alv_data->* TO <lt_alv>.
+    CHECK <lt_alv> IS ASSIGNED.
+
+    " Loop through all rows to find new rows and revalidate them
+    LOOP AT <lt_alv> ASSIGNING <ls_row>.
+      ASSIGN COMPONENT 'IS_NEW' OF STRUCTURE <ls_row> TO <lv_new_flag>.
+      CHECK <lv_new_flag> IS ASSIGNED AND <lv_new_flag> = 'X'.
+
+      " Skip if deleted
+      ASSIGN COMPONENT 'IS_DELETED' OF STRUCTURE <ls_row> TO <lv_del_flag>.
+      CHECK <lv_del_flag> IS NOT ASSIGNED OR <lv_del_flag> <> 'X'.
+
+      " Check if all key fields are filled
+      DATA(lv_all_keys_filled) = abap_true.
+      LOOP AT lt_key_fcat INTO ls_key_fcat.
+        ASSIGN COMPONENT ls_key_fcat-fieldname OF STRUCTURE <ls_row> TO <lv_val>.
+        IF <lv_val> IS ASSIGNED AND <lv_val> IS INITIAL.
+          lv_all_keys_filled = abap_false.
+          EXIT.
+        ENDIF.
+      ENDLOOP.
+
+      " Get row and color components
+      ASSIGN COMPONENT 'IS_ERROR' OF STRUCTURE <ls_row> TO <lv_err_flag>.
+      ASSIGN COMPONENT 'ROW_COLOR' OF STRUCTURE <ls_row> TO <lv_row_color>.
+
+      " If not all keys filled, clear error flag (color handled by set_color)
+      IF lv_all_keys_filled = abap_false.
+        IF <lv_err_flag> IS ASSIGNED.
+          CLEAR <lv_err_flag>.  " Clear error flag for incomplete keys
+        ENDIF.
+        CONTINUE.
+      ENDIF.
+
+      " Check duplicate with other ALV rows (non-deleted) - check all rows
+      DATA(lv_is_dup) = abap_false.
+      DATA: lv_current_index TYPE i.
+      lv_current_index = sy-tabix.
+
+      " Build current row key values
+      DATA: lt_current_keys TYPE TABLE OF string.
+      CLEAR lt_current_keys.
+      LOOP AT lt_key_fcat INTO ls_key_fcat.
+        ASSIGN COMPONENT ls_key_fcat-fieldname OF STRUCTURE <ls_row> TO <lv_val>.
+        APPEND to_upper( |{ <lv_val> }| ) TO lt_current_keys.
+      ENDLOOP.
+
+      " Check against all ALV rows (except self)
+      LOOP AT <lt_alv> ASSIGNING FIELD-SYMBOL(<ls_other_row>).
+        " Skip self-comparison
+        CHECK sy-tabix <> lv_current_index.
+
+        ASSIGN COMPONENT 'IS_DELETED' OF STRUCTURE <ls_other_row> TO FIELD-SYMBOL(<lv_other_deleted>).
+        CHECK <lv_other_deleted> IS NOT ASSIGNED OR <lv_other_deleted> <> 'X'.
+
+        " Build other row key
+        DATA: lt_other_keys TYPE TABLE OF string.
+        CLEAR lt_other_keys.
+        LOOP AT lt_key_fcat INTO ls_key_fcat.
+          ASSIGN COMPONENT ls_key_fcat-fieldname OF STRUCTURE <ls_other_row> TO <lv_val>.
+          APPEND to_upper( |{ <lv_val> }| ) TO lt_other_keys.
+        ENDLOOP.
+
+        IF lt_current_keys = lt_other_keys.
+          lv_is_dup = abap_true.
+          EXIT.
+        ENDIF.
+      ENDLOOP.
+
+      " Update error flag based on duplicate status (color will be handled by set_color)
+      IF <lv_err_flag> IS ASSIGNED.
+        IF lv_is_dup = abap_true.
+          <lv_err_flag> = 'X'.  " Mark as error
+        ELSE.
+          <lv_err_flag> = ' '.   " Clear error flag
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+
+    " Refresh colors and ALV to show updated status
+    PERFORM set_color.
+    IF go_grid IS BOUND.
+      CALL METHOD go_grid->refresh_table_display
+        EXPORTING
+          is_stable = VALUE #( row = abap_true col = abap_true ).
+    ENDIF.
+  ENDMETHOD.
+
+  METHOD handle_data_changed.
+    DATA: lt_key_fcat TYPE lvc_t_fcat,
+          ls_key_fcat TYPE lvc_s_fcat.
+
+    " Set save state to pending when data changes
+    PERFORM set_save_state_pending.
+
+    LOOP AT gt_fieldcat INTO ls_key_fcat WHERE key = abap_true AND fieldname <> 'MANDT'.
+      APPEND ls_key_fcat TO lt_key_fcat.
+    ENDLOOP.
+
+    CHECK lt_key_fcat IS NOT INITIAL.
+
+    FIELD-SYMBOLS: <ls_changed_cell> TYPE lvc_s_modi,
+                   <lt_alv>          TYPE STANDARD TABLE,
+                   <ls_row>          TYPE any,
+                   <lv_val>          TYPE any,
+                   <lv_new_flag>     TYPE any,
+                   <lv_err_flag>     TYPE any,
+                   <lv_del_flag>     TYPE any,
+                   <lv_row_color>    TYPE any.
+
+    ASSIGN gt_alv_data->* TO <lt_alv>.
+    CHECK <lt_alv> IS ASSIGNED.
+
+    DATA: lt_mod_values TYPE TABLE OF lvc_s_modi.
+    lt_mod_values = er_data_changed->mt_mod_cells.
+
+    LOOP AT er_data_changed->mt_mod_cells ASSIGNING <ls_changed_cell>.
+      READ TABLE <lt_alv> ASSIGNING <ls_row> INDEX <ls_changed_cell>-row_id.
+      CHECK sy-subrc = 0.
+
+      ASSIGN COMPONENT 'IS_DELETED' OF STRUCTURE <ls_row> TO <lv_del_flag>.
+      CHECK <lv_del_flag> IS NOT ASSIGNED OR <lv_del_flag> <> 'X'.
+
+      ASSIGN COMPONENT 'IS_NEW' OF STRUCTURE <ls_row> TO <lv_new_flag>.
+      IF <lv_new_flag> IS NOT ASSIGNED OR <lv_new_flag> <> 'X'.
+        CONTINUE.
+      ENDIF.
+
+      READ TABLE lt_key_fcat TRANSPORTING NO FIELDS WITH KEY fieldname = <ls_changed_cell>-fieldname.
+      IF sy-subrc <> 0.
+        CONTINUE.
+      ENDIF.
+
+      DATA(lv_all_keys_filled) = abap_true.
+      LOOP AT lt_key_fcat INTO ls_key_fcat.
+        READ TABLE lt_mod_values ASSIGNING FIELD-SYMBOL(<ls_mod>)
+          WITH KEY row_id   = <ls_changed_cell>-row_id
+                   fieldname = ls_key_fcat-fieldname.
+        IF sy-subrc = 0.
+          IF <ls_mod>-value IS INITIAL.
+            lv_all_keys_filled = abap_false.
+            EXIT.
+          ENDIF.
+        ELSE.
+          ASSIGN COMPONENT ls_key_fcat-fieldname OF STRUCTURE <ls_row> TO <lv_val>.
+          IF <lv_val> IS INITIAL.
+            lv_all_keys_filled = abap_false.
+            EXIT.
+          ENDIF.
+        ENDIF.
+      ENDLOOP.
+
+      IF lv_all_keys_filled = abap_false.
+        ASSIGN COMPONENT 'IS_ERROR' OF STRUCTURE <ls_row> TO <lv_err_flag>.
+        IF <lv_err_flag> IS ASSIGNED.
+          CLEAR <lv_err_flag>.  " Clear error flag for incomplete keys
+        ENDIF.
+        CONTINUE.
+      ENDIF.
+
+      " Use helper method to check duplicate
+      DATA(lv_is_dup) = me->check_key_duplicate(
+        iv_row_id     = <ls_changed_cell>-row_id
+        it_mod_values = lt_mod_values
+        it_key_fcat   = lt_key_fcat
+      ).
+      ASSIGN COMPONENT 'IS_ERROR' OF STRUCTURE <ls_row> TO <lv_err_flag>.
+      IF <lv_err_flag> IS ASSIGNED.
+        IF lv_is_dup = abap_true.
+          <lv_err_flag> = 'X'.  " Mark as error
+        ELSE.
+          <lv_err_flag> = ' '.  " Clear error flag
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+
+    " Refresh colors based on updated error flags
+    PERFORM set_color.
+    IF go_grid IS BOUND.
+      CALL METHOD go_grid->refresh_table_display
+        EXPORTING
+          is_stable = VALUE #( row = abap_true col = abap_true ).
+    ENDIF.
+
+    gv_data_changed = abap_true.
+    " Ensure save state consistency when data changes
+    PERFORM check_save_state_consistency.
+  ENDMETHOD.
+ENDCLASS.
+
+CLASS lcl_value_checker DEFINITION.
+  PUBLIC SECTION.
+    CLASS-METHODS check_domain_value
+      IMPORTING
+        iv_domain       TYPE domname
+        iv_value        TYPE any
+      RETURNING
+        VALUE(rv_valid) TYPE abap_bool.
+ENDCLASS.
+
+CLASS lcl_value_checker IMPLEMENTATION.
+  METHOD check_domain_value.
+    DATA: lt_values TYPE TABLE OF dd07v.
+
+    CALL FUNCTION 'GET_DOMAIN_VALUES'
+      EXPORTING
+        domname    = iv_domain
+      TABLES
+        values_tab = lt_values
+      EXCEPTIONS
+        OTHERS     = 1.
+
+    IF sy-subrc = 0.
+      READ TABLE lt_values WITH KEY domvalue_l = iv_value TRANSPORTING NO FIELDS.
+      rv_valid = boolc( sy-subrc = 0 ).
+    ELSE.
+      rv_valid = abap_true.
+    ENDIF.
+  ENDMETHOD.
+ENDCLASS.
+
+CLASS zcl_backup_event_handler DEFINITION.
+  PUBLIC SECTION.
+    CLASS-METHODS:
+      on_double_click FOR EVENT double_click OF cl_gui_alv_grid
+        IMPORTING e_row e_column es_row_no.
+ENDCLASS.
+
+CLASS zcl_backup_event_handler IMPLEMENTATION.
+  METHOD on_double_click.
+    DATA: ls_backup_display TYPE gty_backup_display.
+
+    " Check if the row index is valid
+    IF e_row-index <= 0 OR e_row-index > lines( gt_backup_display ).
+      MESSAGE 'Invalid row selected' TYPE 'E'.
+      RETURN.
+    ENDIF.
+
+    " Read from gt_backup_display, which is displayed in the ALV grid
+    READ TABLE gt_backup_display INTO ls_backup_display INDEX e_row-index.
+    IF sy-subrc = 0.
+      gv_selected_id = ls_backup_display-backup_id.
+      PERFORM preview_selected_version.
+    ELSE.
+      MESSAGE 'Error retrieving selected version' TYPE 'E'.
+    ENDIF.
+  ENDMETHOD.
+ENDCLASS.

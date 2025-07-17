@@ -1,0 +1,4692 @@
+*&---------------------------------------------------------------------*
+*& Include          YSAP03_DYNAMIC_Z_TABLE_F01
+*&---------------------------------------------------------------------*
+
+FORM init_program.
+  CREATE OBJECT go_tab_mgr TYPE zcl_table_manager.
+  CREATE OBJECT go_evt_hdlr TYPE zcl_table_event_handler.
+  gv_mode = c_mode_display.
+  gv_data_changed = abap_false.
+  " Initialize save state
+  gv_save_state = c_save_state_clean.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form reset_save_state
+*&---------------------------------------------------------------------*
+*& Reset save state to clean
+*&---------------------------------------------------------------------*
+FORM reset_save_state.
+  gv_save_declined = abap_false.
+  gv_save_state = c_save_state_clean.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form set_save_state_pending
+*&---------------------------------------------------------------------*
+*& Set save state to pending when data changes
+*&---------------------------------------------------------------------*
+FORM set_save_state_pending.
+  gv_save_state = c_save_state_pending.
+  gv_save_declined = abap_false.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form set_save_state_declined
+*&---------------------------------------------------------------------*
+*& Set save state to declined when user refuses save
+*&---------------------------------------------------------------------*
+FORM set_save_state_declined.
+  gv_save_state = c_save_state_declined.
+  gv_save_declined = abap_true.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form cleanup_after_declined_save
+*&---------------------------------------------------------------------*
+*& Clean up temporary data after user declines save
+*&---------------------------------------------------------------------*
+FORM cleanup_after_declined_save.
+  " Clean up any backup data that was created but not committed
+  IF gt_backup IS NOT INITIAL.
+    CLEAR gt_backup.
+  ENDIF.
+
+  " Update UI to show current state clearly
+  PERFORM update_alv_title.
+
+  " Set color to indicate pending changes state
+  PERFORM set_color.
+
+  " Show informative message about current state
+  MESSAGE i017(zsap03_msg_cl) DISPLAY LIKE 'W'.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form check_save_state_consistency
+*&---------------------------------------------------------------------*
+*& Check and fix inconsistent save state
+*&---------------------------------------------------------------------*
+FORM check_save_state_consistency.
+  " Ensure save state is consistent with data changed flag
+  IF gv_data_changed = abap_false.
+    gv_save_state = c_save_state_clean.
+    gv_save_declined = abap_false.
+  ELSEIF gv_data_changed = abap_true AND gv_save_state = c_save_state_clean.
+    gv_save_state = c_save_state_pending.
+  ENDIF.
+ENDFORM.
+
+FORM show_z_table_help.
+  DATA: lt_tables TYPE TABLE OF dd02l,
+        lt_return TYPE TABLE OF ddshretval,
+        ls_return TYPE ddshretval.
+
+  SELECT tabname, tabclass, as4local
+    FROM dd02l
+    INTO CORRESPONDING FIELDS OF TABLE @lt_tables
+    WHERE ( tabname LIKE 'Z%' )
+    AND as4local = 'A'
+    AND tabclass = 'TRANSP'
+    ORDER BY tabname.
+
+  CALL FUNCTION 'F4IF_INT_TABLE_VALUE_REQUEST'
+    EXPORTING
+      retfield     = 'TABNAME'
+      value_org    = 'S'
+      window_title = 'Select Z Table'
+    TABLES
+      value_tab    = lt_tables
+      return_tab   = lt_return.
+
+  IF lines( lt_return ) > 0.
+    READ TABLE lt_return INTO ls_return INDEX 1.
+    p_table = ls_return-fieldval.
+  ENDIF.
+ENDFORM.
+
+FORM validate_table_name.
+  DATA: lv_table_upper TYPE tabname.
+  lv_table_upper = p_table.
+  TRANSLATE lv_table_upper TO UPPER CASE.
+
+  IF lv_table_upper+0(1) <> 'Z'.
+    MESSAGE e001(zsap03_msg_cl).
+  ENDIF.
+
+  DATA: lv_exists TYPE tabname.
+  SELECT SINGLE tabname FROM dd02l INTO @lv_exists
+    WHERE tabname = @lv_table_upper
+      AND as4local = 'A'
+      AND as4vers = '0000'.
+
+  IF sy-subrc <> 0.
+    MESSAGE e002(zsap03_msg_cl) WITH lv_table_upper.
+  ENDIF.
+
+  p_table = lv_table_upper.
+ENDFORM.
+
+FORM load_table_data.
+  DATA: lo_data TYPE REF TO data.
+  FIELD-SYMBOLS: <lt_source> TYPE table, <ls_source> TYPE any,
+                 <lt_target> TYPE table, <ls_target> TYPE any.
+
+  " Reset save state when loading fresh data
+  PERFORM reset_save_state.
+
+  TRANSLATE p_table TO UPPER CASE.
+  CLEAR gt_pk_cache.
+
+  gt_table_data = go_tab_mgr->get_table_data( iv_tabname = p_table ).
+  gt_fieldcat   = go_tab_mgr->get_table_structure( p_table ).
+
+  DATA: lt_dd03l     TYPE TABLE OF dd03l,
+        lv_pk_fields TYPE string,
+        lv_pk_count  TYPE i.
+
+  SELECT tabname, fieldname, keyflag, as4vers
+    FROM dd03l
+    INTO TABLE @lt_dd03l
+    WHERE tabname = @p_table
+      AND as4vers = '0000'
+      AND keyflag = 'X'.
+
+  DESCRIBE TABLE lt_dd03l LINES lv_pk_count.
+  IF lv_pk_count > 0.
+    DATA: ls_dd03l TYPE dd03l.
+    LOOP AT lt_dd03l INTO ls_dd03l.
+      IF lv_pk_fields IS INITIAL.
+        lv_pk_fields = |{ ls_dd03l-fieldname }|.
+      ELSE.
+        lv_pk_fields = |{ lv_pk_fields }, { ls_dd03l-fieldname }|.
+      ENDIF.
+    ENDLOOP.
+  ELSE.
+    MESSAGE i003(zsap03_msg_cl) WITH p_table.
+  ENDIF.
+
+  PERFORM prepare_alv_structure.
+
+  ASSIGN gt_table_data->* TO <lt_source>.
+  ASSIGN gt_alv_data->*   TO <lt_target>.
+
+  CHECK <lt_source> IS ASSIGNED AND <lt_target> IS ASSIGNED.
+
+  CLEAR <lt_target>.
+  REFRESH <lt_target>.
+
+  CHECK <lt_source> IS NOT INITIAL.
+  LOOP AT <lt_source> ASSIGNING <ls_source>.
+    DATA: lv_has_content TYPE abap_bool VALUE abap_false.
+
+    LOOP AT gt_fieldcat ASSIGNING FIELD-SYMBOL(<ls_check_field>).
+      ASSIGN COMPONENT <ls_check_field>-fieldname OF STRUCTURE <ls_source>
+        TO FIELD-SYMBOL(<lv_check_value>).
+      IF sy-subrc = 0 AND <lv_check_value> IS NOT INITIAL.
+        lv_has_content = abap_true.
+        EXIT.
+      ENDIF.
+    ENDLOOP.
+
+    CHECK lv_has_content = abap_true.
+    CREATE DATA lo_data LIKE LINE OF <lt_target>.
+    ASSIGN lo_data->* TO <ls_target>.
+    CHECK <ls_target> IS ASSIGNED.
+
+    CLEAR <ls_target>.
+    MOVE-CORRESPONDING <ls_source> TO <ls_target>.
+
+    ASSIGN COMPONENT 'IS_NEW' OF STRUCTURE <ls_target> TO FIELD-SYMBOL(<lv_is_new>).
+    IF sy-subrc = 0.
+      <lv_is_new> = ' '.
+    ENDIF.
+
+    ASSIGN COMPONENT 'IS_ERROR' OF STRUCTURE <ls_target> TO FIELD-SYMBOL(<lv_is_error>).
+    IF sy-subrc = 0.
+      <lv_is_error> = ' '.
+    ENDIF.
+
+    ASSIGN COMPONENT 'IS_DELETED' OF STRUCTURE <ls_target> TO FIELD-SYMBOL(<lv_is_deleted>).
+    IF sy-subrc = 0.
+      <lv_is_deleted> = ' '.
+    ENDIF.
+
+    ASSIGN COMPONENT 'ROW_COLOR' OF STRUCTURE <ls_target> TO FIELD-SYMBOL(<lv_row_color>).
+    IF sy-subrc = 0.
+      CLEAR <lv_row_color>.
+    ENDIF.
+
+    ASSIGN COMPONENT 'STATUS' OF STRUCTURE <ls_target> TO FIELD-SYMBOL(<lv_status>).
+    IF sy-subrc = 0.
+      <lv_status> = 'Active'.
+    ENDIF.
+
+    INSERT <ls_target> INTO TABLE <lt_target>.
+  ENDLOOP.
+
+  DATA: lv_lines TYPE i.
+  DESCRIBE TABLE <lt_target> LINES lv_lines.
+  gv_has_data = COND #( WHEN lv_lines > 0 THEN abap_true ELSE abap_false ).
+ENDFORM.
+
+FORM prepare_alv_structure.
+  DATA: lo_struct     TYPE REF TO cl_abap_structdescr,
+        lo_table      TYPE REF TO cl_abap_tabledescr,
+        lo_new_struct TYPE REF TO cl_abap_structdescr,
+        lo_new_table  TYPE REF TO cl_abap_tabledescr,
+        lt_components TYPE abap_component_tab,
+        ls_component  TYPE abap_componentdescr.
+
+  IF gt_alv_data IS INITIAL.
+    ASSIGN gt_table_data->* TO FIELD-SYMBOL(<lt_source>).
+    IF <lt_source> IS NOT ASSIGNED.
+      MESSAGE e000(01) WITH 'Cannot assign source table'.
+      RETURN.
+    ENDIF.
+
+    lo_table ?= cl_abap_tabledescr=>describe_by_data( <lt_source> ).
+    lo_struct ?= lo_table->get_table_line_type( ).
+
+    lt_components = lo_struct->get_components( ).
+
+    DATA(lt_aux_fields) = VALUE abap_component_tab(
+      ( name = 'IS_NEW'     type = cl_abap_elemdescr=>get_c( p_length = 1 ) )
+      ( name = 'IS_ERROR'   type = cl_abap_elemdescr=>get_c( p_length = 1 ) )
+      ( name = 'IS_DELETED' type = cl_abap_elemdescr=>get_c( p_length = 1 ) )
+      ( name = 'ROW_COLOR'  type = cl_abap_elemdescr=>get_c( p_length = 4 ) )
+      ( name = 'STATUS'     type = cl_abap_elemdescr=>get_c( p_length = 10 ) )
+    ).
+    APPEND LINES OF lt_aux_fields TO lt_components.
+
+    CLEAR ls_component.
+    ls_component-name = 'CELLTAB'.
+    DATA(lo_celltab_type) = cl_abap_typedescr=>describe_by_name( 'LVC_T_STYL' ).
+    ls_component-type = CAST cl_abap_datadescr( lo_celltab_type ).
+    APPEND ls_component TO lt_components.
+
+    lo_new_struct = cl_abap_structdescr=>create( lt_components ).
+    lo_new_table = cl_abap_tabledescr=>create( p_line_type = lo_new_struct ).
+
+    CREATE DATA gt_alv_data TYPE HANDLE lo_new_table.
+  ENDIF.
+
+  IF gt_fieldcat IS NOT INITIAL.
+    LOOP AT gt_fieldcat ASSIGNING FIELD-SYMBOL(<ls_fcat>).
+
+      IF <ls_fcat>-key = abap_true OR <ls_fcat>-fieldname = 'MANDT'.
+        <ls_fcat>-edit = abap_false.
+      ENDIF.
+
+      IF gv_mode = c_mode_display.
+        <ls_fcat>-edit = abap_false.
+      ENDIF.
+
+      IF <ls_fcat>-fieldname = 'CELLTAB' OR <ls_fcat>-fieldname = 'IS_NEW' OR
+         <ls_fcat>-fieldname = 'IS_ERROR' OR <ls_fcat>-fieldname = 'IS_DELETED' OR
+         <ls_fcat>-fieldname = 'ROW_COLOR'.
+        <ls_fcat>-no_out = abap_true.
+        <ls_fcat>-tech = abap_true.
+      ENDIF.
+
+      IF <ls_fcat>-fieldname = 'STATUS'.
+        <ls_fcat>-coltext = 'Status'.
+        <ls_fcat>-scrtext_s = 'Status'.
+        <ls_fcat>-scrtext_m = 'Status'.
+        <ls_fcat>-scrtext_l = 'Row Status'.
+        <ls_fcat>-edit = abap_true.
+        <ls_fcat>-f4availabl = abap_true.
+        <ls_fcat>-ref_table = 'ZTABLE_STATUS'.
+        <ls_fcat>-ref_field = 'STATUS'.
+      ENDIF.
+
+      CASE <ls_fcat>-fieldname.
+        WHEN 'CARRID' OR 'CONNID'.
+          <ls_fcat>-f4availabl = abap_true.
+        WHEN OTHERS.
+      ENDCASE.
+    ENDLOOP.
+  ENDIF.
+ENDFORM.
+
+FORM enter_edit_mode.
+  DATA: lv_original_mode TYPE i.
+  lv_original_mode = gv_mode.
+
+  CASE gv_mode.
+    WHEN c_mode_display.
+      gv_mode = c_mode_edit.
+      " Reset save state to clean when entering edit mode
+      PERFORM reset_save_state.
+
+      PERFORM create_data_snapshot.
+      MESSAGE s004(zsap03_msg_cl).
+
+    WHEN c_mode_edit OR c_mode_create.
+      PERFORM check_data_changes_before.
+
+    WHEN OTHERS.
+      gv_mode = c_mode_display.
+      MESSAGE s005(zsap03_msg_cl).
+  ENDCASE.
+
+  IF gv_mode = c_mode_display.
+    PERFORM set_display_mode_protection.
+  ELSE.
+    PERFORM optimized_alv_update.
+  ENDIF.
+ENDFORM.
+
+FORM enter_create_mode.
+
+  gv_mode = c_mode_create.
+  " Reset save state to clean when entering create mode
+  PERFORM reset_save_state.
+
+  PERFORM update_fcat_protection.
+  FIELD-SYMBOLS:
+    <lt_alv>    TYPE ANY TABLE,
+    <ls_line>   TYPE any,
+    <lv_is_new> TYPE any.
+  DATA:
+    lo_table_type TYPE REF TO cl_abap_tabledescr,
+    lo_line_type  TYPE REF TO cl_abap_structdescr,
+    lr_data       TYPE REF TO data.
+  ASSIGN gt_alv_data->* TO <lt_alv>.
+  IF <lt_alv> IS NOT ASSIGNED.
+    MESSAGE e006(zsap03_msg_cl).
+    RETURN.
+  ENDIF.
+  lo_table_type ?= cl_abap_tabledescr=>describe_by_data( <lt_alv> ).
+  lo_line_type ?= lo_table_type->get_table_line_type( ).
+  CREATE DATA lr_data TYPE HANDLE lo_line_type.
+  ASSIGN lr_data->* TO <ls_line>.
+
+  IF <ls_line> IS ASSIGNED.
+    CLEAR <ls_line>.
+    ASSIGN COMPONENT 'MANDT' OF STRUCTURE <ls_line> TO FIELD-SYMBOL(<lv_mandt>).
+    IF sy-subrc = 0.
+      <lv_mandt> = sy-mandt.
+    ENDIF.
+    ASSIGN COMPONENT 'IS_NEW' OF STRUCTURE <ls_line> TO <lv_is_new>.
+    IF sy-subrc = 0.
+      <lv_is_new> = 'X'.
+    ELSE.
+      MESSAGE e007(zsap03_msg_cl).
+    ENDIF.
+
+    ASSIGN COMPONENT 'IS_ERROR' OF STRUCTURE <ls_line> TO FIELD-SYMBOL(<lv_is_error_new>).
+    IF sy-subrc = 0.
+      <lv_is_error_new> = ' '.
+    ENDIF.
+
+    ASSIGN COMPONENT 'IS_DELETED' OF STRUCTURE <ls_line> TO FIELD-SYMBOL(<lv_is_deleted_new>).
+    IF sy-subrc = 0.
+      <lv_is_deleted_new> = ' '.
+    ENDIF.
+
+    ASSIGN COMPONENT 'ROW_COLOR' OF STRUCTURE <ls_line> TO FIELD-SYMBOL(<lv_row_color_new>).
+    IF sy-subrc = 0.
+      <lv_row_color_new> = 'C510'.  " Green for new rows
+    ENDIF.
+
+    ASSIGN COMPONENT 'STATUS' OF STRUCTURE <ls_line> TO FIELD-SYMBOL(<lv_status_new>).
+    IF sy-subrc = 0.
+      <lv_status_new> = 'New'.
+    ENDIF.
+
+    INSERT <ls_line> INTO TABLE <lt_alv>.
+
+    PERFORM optimized_alv_update.
+  ELSE.
+    MESSAGE e008(zsap03_msg_cl).
+  ENDIF.
+ENDFORM.
+
+FORM set_cell_styles.
+  DATA: lt_celltab TYPE lvc_t_styl,
+        ls_celltab TYPE lvc_s_styl,
+        lt_dd03l   TYPE TABLE OF dd03l.
+
+  FIELD-SYMBOLS: <lt_alv>        TYPE ANY TABLE,
+                 <ls_alv>        TYPE any,
+                 <lv_is_new>     TYPE any,
+                 <lv_is_error>   TYPE any,
+                 <lv_is_deleted> TYPE any,
+                 <lt_celltab>    TYPE lvc_t_styl.
+
+  ASSIGN gt_alv_data->* TO <lt_alv>.
+  CHECK <lt_alv> IS ASSIGNED AND gt_fieldcat IS NOT INITIAL.
+
+  PERFORM get_cached_primary_keys CHANGING lt_dd03l.
+
+  LOOP AT <lt_alv> ASSIGNING <ls_alv>.
+    CLEAR lt_celltab.
+
+    ASSIGN COMPONENT 'IS_NEW' OF STRUCTURE <ls_alv> TO <lv_is_new>.
+    ASSIGN COMPONENT 'IS_ERROR' OF STRUCTURE <ls_alv> TO <lv_is_error>.
+    ASSIGN COMPONENT 'IS_DELETED' OF STRUCTURE <ls_alv> TO <lv_is_deleted>.
+
+    LOOP AT gt_fieldcat ASSIGNING FIELD-SYMBOL(<ls_fcat>).
+      CLEAR ls_celltab.
+      ls_celltab-fieldname = <ls_fcat>-fieldname.
+
+      READ TABLE lt_dd03l TRANSPORTING NO FIELDS
+        WITH KEY tabname = p_table
+                 fieldname = <ls_fcat>-fieldname
+                 keyflag = 'X'.
+
+      DATA(lv_is_key) = COND abap_bool(
+        WHEN sy-subrc = 0 OR <ls_fcat>-fieldname = 'MANDT' OR <ls_fcat>-key = abap_true
+        THEN abap_true ELSE abap_false ).
+
+      IF <lv_is_deleted> IS ASSIGNED AND <lv_is_deleted> = 'X'.
+        ls_celltab-style = cl_gui_alv_grid=>mc_style_disabled.
+      ELSEIF lv_is_key = abap_true.
+        IF <lv_is_new> IS ASSIGNED AND <lv_is_new> = 'X'.
+          ls_celltab-style = cl_gui_alv_grid=>mc_style_enabled.
+        ELSE.
+          ls_celltab-style = cl_gui_alv_grid=>mc_style_disabled.
+        ENDIF.
+      ELSE.
+        CASE gv_mode.
+          WHEN c_mode_display.
+            ls_celltab-style = cl_gui_alv_grid=>mc_style_disabled.
+          WHEN c_mode_edit OR c_mode_create.
+            ls_celltab-style = cl_gui_alv_grid=>mc_style_enabled.
+          WHEN OTHERS.
+            ls_celltab-style = cl_gui_alv_grid=>mc_style_disabled.
+        ENDCASE.
+      ENDIF.
+
+      INSERT ls_celltab INTO TABLE lt_celltab.
+    ENDLOOP.
+    ASSIGN COMPONENT 'CELLTAB' OF STRUCTURE <ls_alv> TO <lt_celltab>.
+    IF sy-subrc = 0.
+      <lt_celltab> = lt_celltab.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.
+
+
+
+FORM save_data_and_check_result CHANGING cv_save_successful TYPE abap_bool.
+  DATA: lv_error_count_before TYPE i,
+        lv_error_count_after  TYPE i.
+  PERFORM count_error_rows CHANGING lv_error_count_before.
+  PERFORM save_data.
+  PERFORM count_error_rows CHANGING lv_error_count_after.
+  IF lv_error_count_after = 0.
+    cv_save_successful = abap_true.
+  ELSE.
+    cv_save_successful = abap_false.
+  ENDIF.
+ENDFORM.
+
+FORM count_error_rows CHANGING cv_error_count TYPE i.
+  FIELD-SYMBOLS: <lt_alv_data> TYPE ANY TABLE,
+                 <ls_alv_line> TYPE any.
+
+  cv_error_count = 0.
+
+  ASSIGN gt_alv_data->* TO <lt_alv_data>.
+  CHECK <lt_alv_data> IS ASSIGNED.
+
+  LOOP AT <lt_alv_data> ASSIGNING <ls_alv_line>.
+    ASSIGN COMPONENT 'IS_ERROR' OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_is_error>).
+    IF <lv_is_error> IS ASSIGNED AND <lv_is_error> = 'X'.
+      cv_error_count = cv_error_count + 1.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.
+
+FORM save_data.
+  FIELD-SYMBOLS: <lt_alv_data>     TYPE ANY TABLE,
+                 <lt_table_data>   TYPE ANY TABLE,
+                 <lt_deleted_data> TYPE ANY TABLE,
+                 <ls_alv_line>     TYPE any,
+                 <ls_table_line>   TYPE any.
+
+  DATA: lv_answer         TYPE c,
+        lv_success_count  TYPE i,
+        lv_error_count    TYPE i,
+        lv_delete_count   TYPE i,
+        lv_cancel_count   TYPE i,
+        lv_insert_count   TYPE i,
+        lv_update_count   TYPE i,
+        lt_row_results    TYPE TABLE OF i,
+        lv_error_messages TYPE string,
+        lv_full_message   TYPE string,
+        lv_msg_len        TYPE i,
+        lv_txt2           TYPE string,
+        lv_txt3           TYPE string,
+        lv_txt4           TYPE string,
+        lv_remaining_len  TYPE i,
+        lv_final_len      TYPE i,
+        lv_has_changes    TYPE abap_bool.
+
+  CLEAR: gt_added_rows, gt_modified_rows, gt_deleted_rows.
+  ASSIGN gt_alv_data->* TO <lt_alv_data>.
+  DESCRIBE TABLE <lt_alv_data> LINES DATA(lv_alv_lines).
+
+  PERFORM create_backup USING TEXT-a24.
+  ASSIGN gt_table_data->* TO <lt_table_data>.
+  IF gt_deleted_data IS BOUND.
+    ASSIGN gt_deleted_data->* TO <lt_deleted_data>.
+  ENDIF.
+
+  CHECK <lt_alv_data> IS ASSIGNED AND <lt_table_data> IS ASSIGNED.
+  IF go_grid IS BOUND.
+    CALL METHOD go_grid->check_changed_data.
+  ENDIF.
+
+  PERFORM check_data_changes_for_save CHANGING lv_has_changes.
+  IF lv_has_changes = abap_false.
+    MESSAGE i016(zsap03_msg_cl).
+    RETURN.
+  ENDIF.
+  CLEAR <lt_table_data>.
+  DATA: lt_save_data        TYPE REF TO data,
+        lv_has_data_to_save TYPE abap_bool VALUE abap_false.
+  FIELD-SYMBOLS: <lt_save_table> TYPE ANY TABLE.
+
+  CREATE DATA lt_save_data LIKE <lt_table_data>.
+  ASSIGN lt_save_data->* TO <lt_save_table>.
+  DATA: lv_alv_loop_index TYPE i VALUE 0,
+        lv_is_new_row     TYPE abap_bool VALUE abap_false.
+  FIELD-SYMBOLS: <lt_original_data> TYPE ANY TABLE.
+  ASSIGN gt_table_data->* TO <lt_original_data>.
+
+  LOOP AT <lt_alv_data> ASSIGNING <ls_alv_line>.
+    lv_alv_loop_index = lv_alv_loop_index + 1.
+    ASSIGN COMPONENT 'IS_DELETED' OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_is_deleted>).
+    IF <lv_is_deleted> IS ASSIGNED AND <lv_is_deleted> = 'X'.
+      CONTINUE.
+    ENDIF.
+    ASSIGN COMPONENT 'IS_NEW' OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_is_new>).
+    lv_is_new_row = abap_false.
+    IF <lv_is_new> IS ASSIGNED AND <lv_is_new> = 'X'.
+      lv_is_new_row = abap_true.
+    ENDIF.
+    DATA: lo_clean_line TYPE REF TO data.
+    CREATE DATA lo_clean_line LIKE LINE OF <lt_save_table>.
+    ASSIGN lo_clean_line->* TO <ls_table_line>.
+
+    IF <ls_table_line> IS ASSIGNED.
+      CLEAR <ls_table_line>.
+
+      LOOP AT gt_fieldcat ASSIGNING FIELD-SYMBOL(<ls_fcat>)
+        WHERE fieldname <> 'IS_NEW' AND fieldname <> 'IS_DELETED' AND fieldname <> 'CELLTAB' AND fieldname <> 'STATUS'.
+
+        ASSIGN COMPONENT <ls_fcat>-fieldname OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_source>).
+        ASSIGN COMPONENT <ls_fcat>-fieldname OF STRUCTURE <ls_table_line> TO FIELD-SYMBOL(<lv_target>).
+
+        IF <lv_source> IS ASSIGNED AND <lv_target> IS ASSIGNED.
+          <lv_target> = <lv_source>.
+        ENDIF.
+      ENDLOOP.
+      IF lv_is_new_row = abap_true.
+        lv_has_data_to_save = abap_true.
+      ELSE.
+        DATA: lv_row_changed TYPE abap_bool.
+        PERFORM check_alv_vs_original USING <ls_alv_line> <lt_original_data>
+                                     CHANGING lv_row_changed.
+
+        IF lv_row_changed = abap_true.
+          lv_has_data_to_save = abap_true.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+  DATA: lv_data_lines TYPE i.
+  DATA: lv_delete_lines TYPE i VALUE 0.
+  IF <lt_deleted_data> IS ASSIGNED.
+    DESCRIBE TABLE <lt_deleted_data> LINES lv_delete_lines.
+  ENDIF.
+  DATA: lv_cancel_lines TYPE i VALUE 0.
+  FIELD-SYMBOLS: <ls_alv_for_count> TYPE any.
+  LOOP AT <lt_alv_data> ASSIGNING <ls_alv_for_count>.
+    ASSIGN COMPONENT 'IS_DELETED' OF STRUCTURE <ls_alv_for_count> TO FIELD-SYMBOL(<lv_is_del_count>).
+    ASSIGN COMPONENT 'IS_NEW' OF STRUCTURE <ls_alv_for_count> TO FIELD-SYMBOL(<lv_is_new_count>).
+
+    IF <lv_is_del_count> IS ASSIGNED AND <lv_is_new_count> IS ASSIGNED.
+      IF <lv_is_del_count> = 'X' AND <lv_is_new_count> = 'X'.
+        lv_cancel_lines = lv_cancel_lines + 1.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+  DATA(lv_total_delete_count) = lv_delete_lines + lv_cancel_lines.
+  IF lv_has_data_to_save = abap_false AND lv_total_delete_count = 0.
+    MESSAGE i010(zsap03_msg_cl) DISPLAY LIKE 'E'.
+    RETURN.
+  ENDIF.
+  IF gv_skip_save_confirm = abap_true.
+    lv_answer = '1'.
+  ELSE.
+    CALL FUNCTION 'POPUP_TO_CONFIRM'
+      EXPORTING
+        titlebar              = 'Confirm Save'
+        text_question         = 'Save changes?'
+        text_button_1         = 'Yes'
+        text_button_2         = 'No'
+        display_cancel_button = ''
+      IMPORTING
+        answer                = lv_answer.
+  ENDIF.
+  gv_skip_save_confirm = abap_false.
+
+  " Handle user response to save confirmation
+  IF lv_answer <> '1'.
+    " User declined to save - set appropriate state and cleanup
+    PERFORM set_save_state_declined.
+    PERFORM cleanup_after_declined_save.
+    RETURN.
+  ENDIF.
+
+  " User confirmed save - continue with save process
+  IF <lt_deleted_data> IS ASSIGNED AND <lt_deleted_data> IS NOT INITIAL.
+    LOOP AT <lt_deleted_data> ASSIGNING FIELD-SYMBOL(<ls_deleted_item>).
+      DATA lv_key_string TYPE string.
+      CLEAR lv_key_string.
+      LOOP AT gt_fieldcat INTO DATA(ls_fcat) WHERE key = abap_true.
+        ASSIGN COMPONENT ls_fcat-fieldname OF STRUCTURE <ls_deleted_item> TO FIELD-SYMBOL(<lv_key_value>).
+        IF lv_key_string IS INITIAL.
+          lv_key_string = |{ <lv_key_value> }|.
+        ELSE.
+          lv_key_string = |{ lv_key_string }, { <lv_key_value> }|.
+        ENDIF.
+      ENDLOOP.
+      IF lv_key_string IS NOT INITIAL.
+        APPEND lv_key_string TO gt_deleted_rows.
+      ENDIF.
+    ENDLOOP.
+    LOOP AT <lt_deleted_data> ASSIGNING <ls_deleted_item>.
+      DELETE (p_table) FROM <ls_deleted_item>.
+      IF sy-subrc = 0.
+        COMMIT WORK AND WAIT.
+        lv_delete_count = lv_delete_count + 1.
+      ELSE.
+        ROLLBACK WORK.
+      ENDIF.
+    ENDLOOP.
+    CLEAR gt_deleted_data.
+
+
+  ENDIF.
+
+  CLEAR: lt_row_results, lv_cancel_count.
+  DATA: lt_row_results_bool TYPE gty_success_flags.
+  DATA: lv_real_alv_index        TYPE i VALUE 0,
+        lr_table_line            TYPE REF TO data,
+        lv_current_row_key_empty TYPE abap_bool,
+        lv_validation_error_msg  TYPE string,
+        lv_skip_error_count      TYPE i VALUE 0.
+
+  LOOP AT <lt_alv_data> ASSIGNING <ls_alv_line>.
+    lv_real_alv_index = lv_real_alv_index + 1.
+    ASSIGN COMPONENT 'IS_DELETED' OF STRUCTURE <ls_alv_line> TO <lv_is_deleted>.
+    IF <lv_is_deleted> IS ASSIGNED AND <lv_is_deleted> = 'X'.
+      ASSIGN COMPONENT 'IS_NEW' OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_is_new_check>).
+      IF <lv_is_new_check> IS ASSIGNED AND <lv_is_new_check> = 'X'.
+        lv_cancel_count = lv_cancel_count + 1.
+      ENDIF.
+      CONTINUE.
+    ENDIF.
+    " Skip rows with errors (already rechecked above)
+    ASSIGN COMPONENT 'IS_ERROR' OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_is_error_check>).
+    IF <lv_is_error_check> IS ASSIGNED AND <lv_is_error_check> = 'X'.
+      lv_skip_error_count = lv_skip_error_count + 1.
+      CONTINUE.
+    ENDIF.
+    CREATE DATA lr_table_line TYPE (p_table).
+    ASSIGN lr_table_line->* TO <ls_table_line>.
+    CHECK <ls_table_line> IS ASSIGNED.
+
+    LOOP AT gt_fieldcat INTO DATA(ls_fcat_copy) WHERE fieldname <> 'IS_NEW'
+                                                 AND fieldname <> 'IS_DELETED'
+                                                 AND fieldname <> 'IS_ERROR'
+                                                 AND fieldname <> 'ROW_COLOR'
+                                                 AND fieldname <> 'CELLTAB'.
+      ASSIGN COMPONENT ls_fcat_copy-fieldname OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_alv_field>).
+      ASSIGN COMPONENT ls_fcat_copy-fieldname OF STRUCTURE <ls_table_line> TO FIELD-SYMBOL(<lv_table_field>).
+
+      IF <lv_alv_field> IS ASSIGNED AND <lv_table_field> IS ASSIGNED.
+        <lv_table_field> = <lv_alv_field>.
+      ENDIF.
+    ENDLOOP.
+
+    ASSIGN COMPONENT 'IS_NEW' OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_alv_is_new>).
+
+    IF <lv_alv_is_new> IS ASSIGNED AND <lv_alv_is_new> = 'X'.
+      CLEAR: lv_current_row_key_empty, lv_validation_error_msg.
+
+      " **ENHANCED: Apply different validation logic based on number of primary keys**
+      PERFORM check_primary_key_validation
+        USING <ls_table_line>
+              lv_real_alv_index
+        CHANGING lv_current_row_key_empty
+                 lv_validation_error_msg.
+
+      IF lv_current_row_key_empty = abap_true.
+        PERFORM log_error USING lv_validation_error_msg CHANGING lv_error_count lt_row_results_bool lv_error_messages.
+        PERFORM mark_row_error USING lv_real_alv_index.
+      ELSE.
+        PERFORM process_insert_row
+          USING <ls_table_line>
+                lv_real_alv_index
+          CHANGING lv_success_count
+                   lv_insert_count
+                   lv_error_count
+                   lt_row_results_bool
+                   lv_error_messages.
+        IF sy-subrc = 0 AND lv_insert_count > 0.
+          APPEND lv_real_alv_index TO gt_added_rows.
+        ENDIF.
+      ENDIF.
+    ELSE.
+      DATA: lv_has_real_change TYPE abap_bool.
+      PERFORM check_alv_vs_database USING <ls_table_line>
+                                   CHANGING lv_has_real_change.
+
+      IF lv_has_real_change = abap_true.
+        PERFORM process_update_row
+          USING <ls_table_line>
+                lv_real_alv_index
+          CHANGING lv_success_count
+                   lv_update_count
+                   lv_error_count
+                   lt_row_results_bool
+                   lv_error_messages.
+        IF sy-subrc = 0 AND lv_update_count > 0.
+          APPEND lv_real_alv_index TO gt_modified_rows.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+  PERFORM update_success_flags USING lt_row_results_bool.
+
+  PERFORM refresh_alv_after_save.
+
+  DATA: lv_summary_message TYPE string,
+        lv_total_deleted   TYPE i.
+
+  lv_total_deleted = lv_delete_count + lv_cancel_count.
+
+
+  DATA: lt_message_parts TYPE TABLE OF string.
+
+  IF lv_insert_count > 0 OR lv_update_count > 0 OR lv_total_deleted > 0.
+    PERFORM insert_data.
+    PERFORM send_email.
+  ELSE.
+    MESSAGE i010(zsap03_msg_cl) DISPLAY LIKE 'E'.
+  ENDIF.
+
+  IF lv_insert_count > 0.
+    APPEND |✅ { lv_insert_count } rows inserted| TO lt_message_parts.
+  ENDIF.
+
+  IF lv_update_count > 0.
+    APPEND |📝 { lv_update_count } rows updated| TO lt_message_parts.
+  ENDIF.
+
+  IF lv_total_deleted > 0.
+    APPEND |🗑️ { lv_total_deleted } rows deleted| TO lt_message_parts.
+  ENDIF.
+
+  DATA(lv_total_error_count) = lv_error_count + lv_skip_error_count.
+  IF lv_total_error_count > 0.
+    IF lv_skip_error_count > 0 AND lv_error_count > 0.
+      APPEND |❌ { lv_total_error_count } rows with errors ({ lv_skip_error_count } skipped, { lv_error_count } new errors)| TO lt_message_parts.
+    ELSEIF lv_skip_error_count > 0.
+      APPEND |❌ { lv_skip_error_count } rows skipped (fix errors first)| TO lt_message_parts.
+    ELSE.
+      APPEND |❌ { lv_error_count } rows with errors| TO lt_message_parts.
+    ENDIF.
+  ENDIF.
+
+  IF lt_message_parts IS NOT INITIAL.
+    LOOP AT lt_message_parts INTO DATA(lv_part).
+      IF sy-tabix = 1.
+        lv_summary_message = lv_part.
+      ELSE.
+        lv_summary_message = |{ lv_summary_message }, { lv_part }|.
+      ENDIF.
+    ENDLOOP.
+  ELSE.
+    lv_summary_message = |ℹ️ No data to process|.
+  ENDIF.
+
+  IF lv_total_error_count = 0.
+    MESSAGE s013(zsap03_msg_cl) WITH lv_summary_message.
+
+    gv_data_changed = abap_false.
+    " Reset save state to clean on successful save
+    PERFORM reset_save_state.
+    IF gv_mode = c_mode_edit OR gv_mode = c_mode_create.
+      gv_mode = c_mode_display.
+      PERFORM update_fcat_protection.
+      PERFORM set_alv_layout.
+
+
+      IF go_grid IS BOUND.
+        CALL METHOD go_grid->set_frontend_fieldcatalog
+          EXPORTING
+            it_fieldcatalog = gt_fieldcat.
+        CALL METHOD go_grid->set_frontend_layout
+          EXPORTING
+            is_layout = gs_layout.
+      ENDIF.
+    ENDIF.
+  ELSEIF lv_success_count > 0 AND lv_total_error_count > 0.
+    MESSAGE s013(zsap03_msg_cl) WITH lv_summary_message DISPLAY LIKE 'W'.
+
+    " **ENHANCED: Show detailed error popup for mixed scenario like all-error scenario**
+    IF lv_error_messages IS NOT INITIAL.
+      DATA: lv_detailed_message_mixed TYPE string.
+      lv_detailed_message_mixed = |{ lv_summary_message }{ cl_abap_char_utilities=>cr_lf }Error details: { lv_error_messages }|.
+
+      CALL FUNCTION 'POPUP_TO_INFORM'
+        EXPORTING
+          titel = 'Data Save Results'
+          txt1  = lv_detailed_message_mixed
+          txt2  = space
+          txt3  = space
+          txt4  = space.
+    ENDIF.
+
+    " **FIXED: Keep data_changed = true for mixed scenario to ensure confirm popup on mode switch**
+    " Don't reset gv_data_changed and save state because error rows still exist
+    " gv_data_changed = abap_false.  " ❌ REMOVED - Keep true to trigger confirmation
+    " PERFORM reset_save_state.      " ❌ REMOVED - Keep pending state for error rows
+
+  ELSEIF lv_success_count > 0.
+    MESSAGE s013(zsap03_msg_cl) WITH lv_summary_message.
+    gv_data_changed = abap_false.
+    " Reset save state to clean on successful save
+    PERFORM reset_save_state.
+    IF gv_mode = c_mode_edit OR gv_mode = c_mode_create.
+      gv_mode = c_mode_display.
+      PERFORM update_fcat_protection.
+      PERFORM set_alv_layout.
+
+      IF go_grid IS BOUND.
+        CALL METHOD go_grid->set_frontend_fieldcatalog
+          EXPORTING
+            it_fieldcatalog = gt_fieldcat.
+        CALL METHOD go_grid->set_frontend_layout
+          EXPORTING
+            is_layout = gs_layout.
+      ENDIF.
+    ENDIF.
+  ELSE.
+    MESSAGE i011(zsap03_msg_cl) WITH lv_summary_message DISPLAY LIKE 'W'.
+
+    IF lv_error_messages IS NOT INITIAL.
+      DATA: lv_detailed_message TYPE string.
+      lv_detailed_message = |{ lv_summary_message }{ cl_abap_char_utilities=>cr_lf }Error details: { lv_error_messages }|.
+
+      lv_msg_len = strlen( lv_detailed_message ).
+
+      IF lv_msg_len > 0.
+        IF lv_msg_len >= 50.
+          lv_txt2 = lv_detailed_message(50).
+        ELSE.
+          lv_txt2 = lv_detailed_message.
+        ENDIF.
+      ENDIF.
+
+      IF lv_msg_len > 50.
+        IF lv_msg_len >= 100.
+          lv_txt3 = lv_detailed_message+50(50).
+        ELSE.
+          lv_remaining_len = lv_msg_len - 50.
+          IF lv_remaining_len > 0.
+            lv_txt3 = lv_detailed_message+50(lv_remaining_len).
+          ENDIF.
+        ENDIF.
+      ENDIF.
+
+      IF lv_msg_len > 100.
+        lv_final_len = lv_msg_len - 100.
+        IF lv_final_len > 0.
+          IF lv_final_len >= 50.
+            lv_txt4 = lv_detailed_message+100(50).
+          ELSE.
+            lv_txt4 = lv_detailed_message+100(lv_final_len).
+          ENDIF.
+        ENDIF.
+      ENDIF.
+
+      CALL FUNCTION 'POPUP_TO_INFORM'
+        EXPORTING
+          titel = 'Data Save Results'
+          txt1  = lv_detailed_message
+          txt2  = space
+          txt3  = space
+          txt4  = space.
+    ENDIF.
+  ENDIF.
+
+  PERFORM filter_and_refresh_alv.
+
+  IF gv_mode = c_mode_display.
+    PERFORM set_display_mode_protection.
+  ENDIF.
+ENDFORM.
+
+
+
+
+
+FORM filter_and_refresh_alv.
+  FIELD-SYMBOLS: <lt_alv_data> TYPE ANY TABLE,
+                 <ls_alv_line> TYPE any.
+
+  DATA: lr_filtered_data TYPE REF TO data.
+  FIELD-SYMBOLS: <lt_filtered_data> TYPE ANY TABLE.
+
+  ASSIGN gt_alv_data->* TO <lt_alv_data>.
+  CHECK <lt_alv_data> IS ASSIGNED.
+
+  CREATE DATA lr_filtered_data LIKE <lt_alv_data>.
+  ASSIGN lr_filtered_data->* TO <lt_filtered_data>.
+  CHECK <lt_filtered_data> IS ASSIGNED.
+
+  LOOP AT <lt_alv_data> ASSIGNING <ls_alv_line>.
+    ASSIGN COMPONENT 'IS_DELETED' OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_is_deleted>).
+
+    IF <lv_is_deleted> IS NOT ASSIGNED OR <lv_is_deleted> <> 'X'.
+      INSERT <ls_alv_line> INTO TABLE <lt_filtered_data>.
+    ENDIF.
+  ENDLOOP.
+
+  <lt_alv_data> = <lt_filtered_data>.
+
+  gv_title_updated = abap_false.
+  PERFORM update_alv_title_with_filtered USING <lt_filtered_data>.
+  IF gv_mode <> c_mode_display.
+    PERFORM set_color.
+    PERFORM set_cell_styles.
+  ENDIF.
+
+  IF go_grid IS BOUND.
+    CALL METHOD go_grid->refresh_table_display
+      EXPORTING
+        is_stable = VALUE #( row = abap_true col = abap_true ).
+
+    CALL METHOD go_grid->set_frontend_layout
+      EXPORTING
+        is_layout = gs_layout.
+
+    CALL METHOD go_grid->set_frontend_fieldcatalog
+      EXPORTING
+        it_fieldcatalog = gt_fieldcat.
+  ENDIF.
+ENDFORM.
+
+FORM update_alv_title_with_filtered USING pt_filtered_data TYPE ANY TABLE.
+
+  FIELD-SYMBOLS: <ls_line> TYPE any.
+
+  DATA: lv_total_rows TYPE i,
+        lv_new_rows   TYPE i.
+  LOOP AT pt_filtered_data ASSIGNING <ls_line>.
+    lv_total_rows = lv_total_rows + 1.
+
+    ASSIGN COMPONENT 'IS_NEW' OF STRUCTURE <ls_line> TO FIELD-SYMBOL(<lv_is_new>).
+    IF <lv_is_new> IS ASSIGNED AND <lv_is_new> = 'X'.
+      lv_new_rows = lv_new_rows + 1.
+    ENDIF.
+  ENDLOOP.
+  gs_layout-grid_title = |Table data { p_table } - { lv_total_rows } rows (visible)|.
+  IF lv_new_rows > 0.
+    gs_layout-grid_title = |{ gs_layout-grid_title } ({ lv_new_rows } new)|.
+  ENDIF.
+  gv_title_updated = abap_true.
+ENDFORM.
+
+FORM check_alv_vs_database USING ps_table_line TYPE any
+                          CHANGING pv_has_change TYPE abap_bool.
+
+  pv_has_change = abap_false.
+
+  DATA: lv_where_clause TYPE string,
+        lv_key_value    TYPE string,
+        lv_field_value  TYPE string.
+
+  LOOP AT gt_fieldcat INTO DATA(ls_fcat) WHERE key = 'X'.
+    ASSIGN COMPONENT ls_fcat-fieldname OF STRUCTURE ps_table_line TO FIELD-SYMBOL(<lv_key_field>).
+    IF <lv_key_field> IS ASSIGNED.
+      lv_field_value = <lv_key_field>.
+      REPLACE ALL OCCURRENCES OF '''' IN lv_field_value WITH ''''''.
+
+      IF lv_where_clause IS INITIAL.
+        lv_where_clause = |{ ls_fcat-fieldname } = '{ lv_field_value }'|.
+      ELSE.
+        lv_where_clause = |{ lv_where_clause } AND { ls_fcat-fieldname } = '{ lv_field_value }'|.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+  CHECK lv_where_clause IS NOT INITIAL.
+
+  DATA: lr_db_data TYPE REF TO data.
+  FIELD-SYMBOLS: <lt_db_data>   TYPE STANDARD TABLE,
+                 <ls_db_record> TYPE any.
+
+  CREATE DATA lr_db_data TYPE STANDARD TABLE OF (p_table).
+  ASSIGN lr_db_data->* TO <lt_db_data>.
+  CHECK <lt_db_data> IS ASSIGNED.
+
+  TRY.
+      SELECT * FROM (p_table)
+        INTO TABLE <lt_db_data>
+        WHERE (lv_where_clause).
+      IF sy-subrc <> 0 OR lines( <lt_db_data> ) = 0.
+        pv_has_change = abap_true.
+        RETURN.
+      ENDIF.
+      READ TABLE <lt_db_data> INDEX 1 ASSIGNING <ls_db_record>.
+      CHECK <ls_db_record> IS ASSIGNED.
+      LOOP AT gt_fieldcat INTO ls_fcat WHERE key <> 'X'
+                                        AND fieldname <> 'IS_NEW'
+                                        AND fieldname <> 'IS_DELETED'
+                                        AND fieldname <> 'IS_ERROR'
+                                        AND fieldname <> 'ROW_COLOR'
+                                        AND fieldname <> 'CELLTAB'.
+
+        ASSIGN COMPONENT ls_fcat-fieldname OF STRUCTURE ps_table_line TO FIELD-SYMBOL(<lv_alv_field>).
+        ASSIGN COMPONENT ls_fcat-fieldname OF STRUCTURE <ls_db_record> TO FIELD-SYMBOL(<lv_db_field>).
+
+        IF <lv_alv_field> IS ASSIGNED AND <lv_db_field> IS ASSIGNED.
+          IF <lv_alv_field> <> <lv_db_field>.
+            pv_has_change = abap_true.
+            RETURN.
+          ENDIF.
+        ENDIF.
+      ENDLOOP.
+      pv_has_change = abap_false.
+
+    CATCH cx_sy_dynamic_osql_semantics cx_sy_open_sql_db.
+      pv_has_change = abap_true.
+  ENDTRY.
+
+ENDFORM.
+
+FORM set_display_mode_protection.
+
+  DATA: lt_dd03l TYPE TABLE OF dd03l.
+
+  PERFORM get_primary_key_fields CHANGING lt_dd03l.
+
+  LOOP AT gt_fieldcat ASSIGNING FIELD-SYMBOL(<ls_fcat_save>).
+    READ TABLE lt_dd03l TRANSPORTING NO FIELDS
+      WITH KEY tabname = p_table
+               fieldname = <ls_fcat_save>-fieldname
+               keyflag = 'X'.
+
+    IF sy-subrc = 0.
+      <ls_fcat_save>-key = abap_true.
+    ENDIF.
+
+    IF <ls_fcat_save>-fieldname = 'MANDT'.
+      <ls_fcat_save>-key = abap_true.
+    ENDIF.
+
+    <ls_fcat_save>-edit = abap_false.
+  ENDLOOP.
+
+  PERFORM set_color.
+  PERFORM set_cell_styles.
+  PERFORM perform_grid_update.
+ENDFORM.
+
+FORM apply_cell_style_protection.
+  DATA: lt_dd03l TYPE TABLE OF dd03l.
+  PERFORM get_primary_key_fields CHANGING lt_dd03l.
+  LOOP AT gt_fieldcat ASSIGNING FIELD-SYMBOL(<ls_fcat>).
+    READ TABLE lt_dd03l TRANSPORTING NO FIELDS
+      WITH KEY tabname = p_table
+               fieldname = <ls_fcat>-fieldname
+               keyflag = 'X'.
+
+    IF sy-subrc = 0 OR <ls_fcat>-fieldname = 'MANDT'.
+      <ls_fcat>-key = abap_true.
+      <ls_fcat>-emphasize = 'C110'.
+      <ls_fcat>-hotspot = abap_false.
+      IF gv_mode = c_mode_display.
+        <ls_fcat>-edit = abap_false.
+      ELSE.
+        <ls_fcat>-edit = abap_true.
+      ENDIF.
+    ELSE.
+      <ls_fcat>-key = abap_false.
+      CASE gv_mode.
+        WHEN c_mode_display.
+          <ls_fcat>-edit = abap_false.
+        WHEN c_mode_edit OR c_mode_create.
+          <ls_fcat>-edit = abap_true.
+        WHEN OTHERS.
+          <ls_fcat>-edit = abap_false.
+      ENDCASE.
+    ENDIF.
+  ENDLOOP.
+  PERFORM perform_grid_update.
+ENDFORM.
+
+FORM optimized_alv_update.
+  CHECK go_grid IS BOUND.
+  PERFORM update_fcat_protection.
+  PERFORM set_alv_layout.
+  " Set colors ONLY once
+  PERFORM set_color.
+  PERFORM set_cell_styles.
+  CALL METHOD go_grid->set_frontend_fieldcatalog
+    EXPORTING
+      it_fieldcatalog = gt_fieldcat.
+
+  CALL METHOD go_grid->set_frontend_layout
+    EXPORTING
+      is_layout = gs_layout.
+
+  " Manual validation for new rows to ensure duplicate check works
+  IF gv_mode = c_mode_edit OR gv_mode = c_mode_create.
+    CALL METHOD go_evt_hdlr->revalidate_all_new_rows.
+  ENDIF.
+
+  PERFORM filter_and_refresh_alv.
+ENDFORM.
+
+FORM perform_grid_update.
+  "*--------------------------------------------------------------------*
+  "* Utility form to handle common ALV grid update pattern
+  "* Consolidates duplicate code for grid frontend updates
+  "*--------------------------------------------------------------------*
+  CHECK go_grid IS BOUND.
+
+  CALL METHOD go_grid->set_frontend_fieldcatalog
+    EXPORTING
+      it_fieldcatalog = gt_fieldcat.
+
+  CALL METHOD go_grid->set_frontend_layout
+    EXPORTING
+      is_layout = gs_layout.
+
+  CALL METHOD go_grid->refresh_table_display
+    EXPORTING
+      is_stable = VALUE #( row = abap_true col = abap_true ).
+ENDFORM.
+
+FORM get_primary_key_fields CHANGING ct_dd03l TYPE table.
+  "*--------------------------------------------------------------------*
+  "* Utility form to get primary key fields from DD03L
+  "* Consolidates duplicate SELECT statements for key fields
+  "*--------------------------------------------------------------------*
+  SELECT tabname, fieldname, keyflag, as4vers
+    FROM dd03l
+    INTO TABLE @ct_dd03l
+    WHERE tabname = @p_table
+      AND as4vers = '0000'
+      AND keyflag = 'X'.
+ENDFORM.
+
+FORM get_cached_primary_keys CHANGING ct_dd03l TYPE table.
+
+  IF gt_pk_cache IS NOT INITIAL.
+    READ TABLE gt_pk_cache TRANSPORTING NO FIELDS WITH KEY tabname = p_table.
+    IF sy-subrc = 0.
+      ct_dd03l = gt_pk_cache.
+      RETURN.
+    ENDIF.
+  ENDIF.
+  PERFORM get_primary_key_fields CHANGING ct_dd03l.
+  gt_pk_cache = ct_dd03l.
+ENDFORM.
+
+FORM create_data_snapshot.
+  FIELD-SYMBOLS: <lt_current_alv>    TYPE ANY TABLE,
+                 <lt_snapshot_table> TYPE ANY TABLE.
+
+  IF go_grid IS BOUND.
+    CALL METHOD go_grid->check_changed_data.
+  ENDIF.
+  ASSIGN gt_alv_data->* TO <lt_current_alv>.
+  IF <lt_current_alv> IS NOT ASSIGNED.
+    RETURN.
+  ENDIF.
+  CREATE DATA gt_alv_snapshot LIKE <lt_current_alv>.
+  ASSIGN gt_alv_snapshot->* TO <lt_snapshot_table>.
+
+  IF <lt_snapshot_table> IS ASSIGNED.
+    <lt_snapshot_table> = <lt_current_alv>.
+  ENDIF.
+ENDFORM.
+
+FORM check_data_changes_before.
+  DATA: lv_data_changed         TYPE abap_bool,
+        lv_answer               TYPE c,
+        lv_original_mode        TYPE i,
+        lv_save_successful      TYPE abap_bool,
+        lv_has_new_deleted_rows TYPE abap_bool,
+        lv_has_new_valid_rows   TYPE abap_bool,
+        lv_has_other_changes    TYPE abap_bool,
+        lv_has_new_error_rows   TYPE abap_bool,
+        lv_has_new_empty_rows   TYPE abap_bool,
+        lv_has_declined_rows    TYPE abap_bool.
+
+  lv_original_mode = gv_mode.
+
+  IF go_grid IS BOUND.
+    CALL METHOD go_grid->check_changed_data.
+  ENDIF.
+
+  " Check save state consistency first
+  PERFORM check_save_state_consistency.
+
+  " First check simple data changed flag - if false, switch immediately
+  IF gv_data_changed = abap_false.
+    " Clean up any empty new rows before switching
+    PERFORM remove_problematic_new_rows.
+    gv_mode = c_mode_display.
+    PERFORM reset_save_state.
+    PERFORM set_display_mode_protection.
+    PERFORM optimized_alv_refresh.
+    RETURN.
+  ENDIF.
+
+
+
+  " Additional quick check - compare with original data to see if really changed
+  PERFORM quick_check_has_real_changes CHANGING lv_data_changed.
+  IF lv_data_changed = abap_false.
+    " Clean up any empty new rows before switching
+    PERFORM remove_problematic_new_rows.
+    gv_mode = c_mode_display.
+    gv_data_changed = abap_false.
+    PERFORM reset_save_state.
+    PERFORM set_display_mode_protection.
+    PERFORM optimized_alv_refresh.
+    RETURN.
+  ENDIF.
+
+  " Analyze types of changes only if data_changed flag is true
+  PERFORM analyze_data_changes
+    CHANGING lv_has_new_deleted_rows
+             lv_has_new_valid_rows
+             lv_has_other_changes
+             lv_has_new_error_rows
+             lv_has_new_empty_rows
+             lv_has_declined_rows.
+
+  " Double check - if detailed analysis shows no changes, switch to display mode
+  IF lv_has_new_deleted_rows = abap_false AND
+     lv_has_new_valid_rows = abap_false AND
+     lv_has_other_changes = abap_false AND
+     lv_has_new_error_rows = abap_false AND
+     lv_has_new_empty_rows = abap_false AND
+     lv_has_declined_rows = abap_false.
+    " Clean up any empty new rows before switching
+    PERFORM remove_problematic_new_rows.
+    gv_mode = c_mode_display.
+    gv_data_changed = abap_false.
+    PERFORM reset_save_state.
+    PERFORM set_display_mode_protection.
+    PERFORM optimized_alv_refresh.
+    RETURN.
+  ENDIF.
+
+  " Handle different change scenarios
+  " Special case: User declined save - but still ask for confirmation before switch
+  IF lv_has_declined_rows = abap_true.
+    " User declined save previously, but we still want to ask confirmation
+    " Check if we only have empty/error/deleted rows (no valid new rows)
+    IF lv_has_new_valid_rows = abap_false AND
+       ( lv_has_new_empty_rows = abap_true OR lv_has_new_error_rows = abap_true OR lv_has_new_deleted_rows = abap_true ).
+      " Only problematic rows after declined save - ask for confirmation
+      CALL FUNCTION 'POPUP_TO_CONFIRM'
+        EXPORTING
+          titlebar              = 'Confirm Mode Switch'
+          text_question         = 'Data modified. Still switch mode?'
+          text_button_1         = 'Yes'
+          text_button_2         = 'No'
+          display_cancel_button = ''
+        IMPORTING
+          answer                = lv_answer.
+      IF lv_answer = '1'.
+        " User confirmed - remove problematic rows and switch
+        PERFORM remove_problematic_new_rows.
+        gv_mode = c_mode_display.
+        gv_data_changed = abap_false.
+        PERFORM reset_save_state.
+        PERFORM set_display_mode_protection.
+        PERFORM optimized_alv_refresh.
+      ELSE.
+        " User cancelled - stay in edit mode
+        gv_mode = lv_original_mode.
+      ENDIF.
+      RETURN.  " Exit here - don't fall through
+    ENDIF.
+    " If we reach here, it means we have valid data in declined state
+    " Continue with normal flow to ask user what to do
+  ENDIF.
+
+  " Normal case: problematic rows only (but NOT declined rows)
+
+  IF ( lv_has_new_deleted_rows = abap_true OR lv_has_new_error_rows = abap_true OR lv_has_new_empty_rows = abap_true ) AND
+     lv_has_new_valid_rows = abap_false AND
+     lv_has_declined_rows = abap_false.
+     " Note: Removed other_changes check as it may be ALV side effects when creating new rows
+    " Only problematic new rows (deleted/error/empty) - ask about switching mode without save
+    CALL FUNCTION 'POPUP_TO_CONFIRM'
+      EXPORTING
+        titlebar              = 'Confirm Mode Switch'
+        text_question         = 'Data modified. Still switch mode?'
+        text_button_1         = 'Yes'
+        text_button_2         = 'No'
+        display_cancel_button = ''
+      IMPORTING
+        answer                = lv_answer.
+    IF lv_answer = '1'.
+      " Remove problematic new rows and switch to view mode
+      PERFORM remove_problematic_new_rows.
+      gv_mode = c_mode_display.
+      gv_data_changed = abap_false.
+      PERFORM reset_save_state.
+      PERFORM set_display_mode_protection.
+      PERFORM optimized_alv_refresh.
+    ELSE.
+      gv_mode = lv_original_mode.
+    ENDIF.
+  ELSEIF lv_has_new_valid_rows = abap_true OR
+         ( lv_has_other_changes = abap_true AND lv_has_declined_rows = abap_false ).
+    " Has valid new rows or other changes - check if it's mixed scenario
+    IF lv_has_new_valid_rows = abap_true AND
+       ( lv_has_new_error_rows = abap_true OR lv_has_new_empty_rows = abap_true OR lv_has_new_deleted_rows = abap_true ).
+      " Mixed scenario: has both valid and problematic rows
+      CALL FUNCTION 'POPUP_TO_CONFIRM'
+        EXPORTING
+          titlebar              = 'Confirm Mode Switch'
+          text_question         = 'Data modified. Still switch mode?'
+          text_button_1         = 'Yes'
+          text_button_2         = 'No'
+          display_cancel_button = ''
+        IMPORTING
+          answer                = lv_answer.
+      IF lv_answer = '1'.
+        " User wants to switch - save valid rows and remove problematic rows
+        gv_skip_save_confirm = abap_true.
+        PERFORM save_data_and_check_result CHANGING lv_save_successful.
+        " Remove problematic rows regardless of save result
+        PERFORM remove_problematic_new_rows.
+        " Switch to display mode
+        gv_mode = c_mode_display.
+        gv_data_changed = abap_false.
+        PERFORM reset_save_state.
+        PERFORM set_display_mode_protection.
+        PERFORM optimized_alv_refresh.
+      ELSE.
+        " Don't switch mode
+        gv_mode = lv_original_mode.
+      ENDIF.
+    ELSE.
+      " Normal case: only valid rows or only other changes - two-step confirmation
+      CALL FUNCTION 'POPUP_TO_CONFIRM'
+        EXPORTING
+          titlebar              = 'Confirm Mode Switch'
+          text_question         = 'Data modified. Still switch mode?'
+          text_button_1         = 'Yes'
+          text_button_2         = 'No'
+          display_cancel_button = ''
+        IMPORTING
+          answer                = lv_answer.
+      IF lv_answer = '1'.
+        " User wants to switch mode - now ask about saving
+        CALL FUNCTION 'POPUP_TO_CONFIRM'
+          EXPORTING
+            titlebar              = 'Confirm Save'
+            text_question         = 'Save changes?'
+            text_button_1         = 'Yes'
+            text_button_2         = 'No'
+            display_cancel_button = ''
+          IMPORTING
+            answer                = lv_answer.
+        IF lv_answer = '1'.
+          " Save and switch if successful - skip save confirmation since user already confirmed
+          gv_skip_save_confirm = abap_true.
+          PERFORM save_data_and_check_result CHANGING lv_save_successful.
+          IF lv_save_successful = abap_true.
+            gv_mode = c_mode_display.
+          ELSE.
+            gv_mode = lv_original_mode.
+          ENDIF.
+        ELSE.
+          " Don't save, stay in edit mode
+          gv_mode = lv_original_mode.
+        ENDIF.
+      ELSE.
+        " Don't switch mode
+        gv_mode = lv_original_mode.
+      ENDIF.
+    ENDIF.
+  ELSE.
+    " No significant changes - switch directly to display mode
+    PERFORM remove_problematic_new_rows.
+    gv_mode = c_mode_display.
+    gv_data_changed = abap_false.
+    PERFORM reset_save_state.
+    PERFORM set_display_mode_protection.
+    PERFORM optimized_alv_refresh.
+  ENDIF.
+ENDFORM.
+
+FORM analyze_data_changes
+  CHANGING cv_has_new_deleted_rows TYPE abap_bool
+           cv_has_new_valid_rows   TYPE abap_bool
+           cv_has_other_changes    TYPE abap_bool
+           cv_has_new_error_rows   TYPE abap_bool
+           cv_has_new_empty_rows   TYPE abap_bool
+           cv_has_declined_rows    TYPE abap_bool.
+  "*--------------------------------------------------------------------*
+  "* Analyze different types of data changes to determine proper action
+  "* - New rows marked for deletion (is_new=X, is_deleted=X)
+  "* - New rows with errors (is_new=X, is_error=X)
+  "* - New empty rows (is_new=X, key fields empty)
+  "* - New valid rows (is_new=X, no error, no deletion, keys filled)
+  "* - Other changes (modified existing rows, deleted existing rows)
+  "*--------------------------------------------------------------------*
+  FIELD-SYMBOLS: <lt_alv_data> TYPE ANY TABLE,
+                 <ls_alv_line> TYPE any.
+
+  " Initialize flags
+  cv_has_new_deleted_rows = abap_false.
+  cv_has_new_valid_rows   = abap_false.
+  cv_has_other_changes    = abap_false.
+  cv_has_new_error_rows   = abap_false.
+  cv_has_new_empty_rows   = abap_false.
+  cv_has_declined_rows    = abap_false.
+
+  ASSIGN gt_alv_data->* TO <lt_alv_data>.
+  CHECK <lt_alv_data> IS ASSIGNED.
+
+  LOOP AT <lt_alv_data> ASSIGNING <ls_alv_line>.
+    ASSIGN COMPONENT 'IS_NEW' OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_is_new>).
+    ASSIGN COMPONENT 'IS_DELETED' OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_is_deleted>).
+    ASSIGN COMPONENT 'IS_ERROR' OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_is_error>).
+
+    " Check for new rows marked for deletion
+    IF <lv_is_new> IS ASSIGNED AND <lv_is_new> = 'X' AND
+       <lv_is_deleted> IS ASSIGNED AND <lv_is_deleted> = 'X'.
+      cv_has_new_deleted_rows = abap_true.
+      " Also check for declined state on deleted rows
+      IF gv_save_state = c_save_state_declined.
+        cv_has_declined_rows = abap_true.
+      ENDIF.
+      CONTINUE.
+    ENDIF.
+
+    " Check for rows with errors (both new and existing)
+    IF <lv_is_error> IS ASSIGNED AND <lv_is_error> = 'X' AND
+       ( <lv_is_deleted> IS NOT ASSIGNED OR <lv_is_deleted> <> 'X' ).
+      " Mark as having error rows regardless of new/old status
+      cv_has_new_error_rows = abap_true.
+      " Also check for declined state on error rows
+      IF gv_save_state = c_save_state_declined.
+        cv_has_declined_rows = abap_true.
+      ENDIF.
+      CONTINUE.
+    ENDIF.
+
+    " Check for new rows (not deleted, not error) - distinguish empty vs valid
+    IF <lv_is_new> IS ASSIGNED AND <lv_is_new> = 'X' AND
+       ( <lv_is_deleted> IS NOT ASSIGNED OR <lv_is_deleted> <> 'X' ) AND
+       ( <lv_is_error> IS NOT ASSIGNED OR <lv_is_error> <> 'X' ).
+
+      " If user has declined save, need special handling for new rows
+      " But still check if they are truly empty vs have valid data
+      DATA(lv_treat_as_declined) = abap_false.
+      IF gv_save_state = c_save_state_declined.
+        lv_treat_as_declined = abap_true.
+      ENDIF.
+
+      " **ENHANCED: Check if it's a valid new row using new PK validation logic**
+      DATA: lv_dummy_empty TYPE abap_bool,
+            lv_dummy_msg   TYPE string.
+      PERFORM check_primary_key_validation
+        USING <ls_alv_line>
+              sy-tabix
+        CHANGING lv_dummy_empty
+                 lv_dummy_msg.
+
+      " For analyze_data_changes, we consider a row valid if PK validation passes
+      " (i.e., not marked as key_empty)
+      DATA(lv_has_valid_key) = COND abap_bool( WHEN lv_dummy_empty = abap_false THEN abap_true ELSE abap_false ).
+
+      " Categorize as valid or empty, considering declined save state
+      IF lv_treat_as_declined = abap_true.
+        " User previously declined save - mark as declined regardless of content
+        cv_has_declined_rows = abap_true.
+        " Also categorize the actual content
+        IF lv_has_valid_key = abap_true.
+          cv_has_new_valid_rows = abap_true.
+        ELSE.
+          cv_has_new_empty_rows = abap_true.
+        ENDIF.
+      ELSE.
+        " Normal case - no previous decline
+        IF lv_has_valid_key = abap_true.
+          cv_has_new_valid_rows = abap_true.
+        ELSE.
+          cv_has_new_empty_rows = abap_true.
+        ENDIF.
+      ENDIF.
+      CONTINUE.
+    ENDIF.
+
+    " Check for deleted existing rows
+    IF <lv_is_deleted> IS ASSIGNED AND <lv_is_deleted> = 'X' AND
+       ( <lv_is_new> IS NOT ASSIGNED OR <lv_is_new> <> 'X' ).
+      cv_has_other_changes = abap_true.
+      CONTINUE.
+    ENDIF.
+
+    " Check for modified existing rows (compare with original data)
+    IF ( <lv_is_new> IS NOT ASSIGNED OR <lv_is_new> <> 'X' ) AND
+       ( <lv_is_deleted> IS NOT ASSIGNED OR <lv_is_deleted> <> 'X' ).
+      DATA: lv_row_changed TYPE abap_bool.
+      FIELD-SYMBOLS: <lt_original_data> TYPE ANY TABLE.
+      ASSIGN gt_table_data->* TO <lt_original_data>.
+      IF <lt_original_data> IS ASSIGNED.
+        PERFORM check_alv_vs_original USING <ls_alv_line> <lt_original_data>
+                                     CHANGING lv_row_changed.
+        IF lv_row_changed = abap_true.
+          cv_has_other_changes = abap_true.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.
+
+FORM remove_problematic_new_rows.
+  "*--------------------------------------------------------------------*
+  "* Remove rows that are new and problematic:
+  "* - New rows marked for deletion (is_new=X, is_deleted=X)
+  "* - New rows with errors (is_new=X, is_error=X)
+  "* - New empty rows (is_new=X, key fields empty)
+  "* These rows should be removed when switching to view mode
+  "*--------------------------------------------------------------------*
+  FIELD-SYMBOLS: <lt_alv_data> TYPE ANY TABLE,
+                 <ls_alv_line> TYPE any.
+
+  ASSIGN gt_alv_data->* TO <lt_alv_data>.
+  CHECK <lt_alv_data> IS ASSIGNED.
+
+  " Create temporary table to store rows to keep
+  DATA: lr_temp_data TYPE REF TO data.
+  FIELD-SYMBOLS: <lt_temp_data> TYPE ANY TABLE.
+
+  CREATE DATA lr_temp_data LIKE <lt_alv_data>.
+  ASSIGN lr_temp_data->* TO <lt_temp_data>.
+  CHECK <lt_temp_data> IS ASSIGNED.
+
+  " Copy non-problematic rows to temporary table
+  LOOP AT <lt_alv_data> ASSIGNING <ls_alv_line>.
+    ASSIGN COMPONENT 'IS_NEW' OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_is_new>).
+    ASSIGN COMPONENT 'IS_DELETED' OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_is_deleted>).
+    ASSIGN COMPONENT 'IS_ERROR' OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_is_error>).
+
+    " Skip new rows marked for deletion
+    IF <lv_is_new> IS ASSIGNED AND <lv_is_new> = 'X' AND
+       <lv_is_deleted> IS ASSIGNED AND <lv_is_deleted> = 'X'.
+      CONTINUE.
+    ENDIF.
+
+    " Skip rows with errors (both new and existing after mixed save)
+    IF <lv_is_error> IS ASSIGNED AND <lv_is_error> = 'X'.
+      CONTINUE.
+    ENDIF.
+
+    " Skip new empty rows (key fields empty)
+    IF <lv_is_new> IS ASSIGNED AND <lv_is_new> = 'X' AND
+       ( <lv_is_deleted> IS NOT ASSIGNED OR <lv_is_deleted> <> 'X' ) AND
+       ( <lv_is_error> IS NOT ASSIGNED OR <lv_is_error> <> 'X' ).
+      " **ENHANCED: Use new PK validation logic to determine if row should be removed**
+      DATA: lv_should_remove TYPE abap_bool,
+            lv_remove_msg    TYPE string.
+      PERFORM check_primary_key_validation
+        USING <ls_alv_line>
+              sy-tabix
+        CHANGING lv_should_remove
+                 lv_remove_msg.
+
+      IF lv_should_remove = abap_true.
+        CONTINUE.  " Skip this problematic row
+      ENDIF.
+    ENDIF.
+
+    " Keep all other rows
+    INSERT <ls_alv_line> INTO TABLE <lt_temp_data>.
+  ENDLOOP.
+
+  " Replace ALV data with cleaned data
+  <lt_alv_data> = <lt_temp_data>.
+  gv_refresh_needed = abap_true.
+ENDFORM.
+
+
+
+
+
+FORM delete_data.
+
+  FIELD-SYMBOLS: <lt_alv_data> TYPE ANY TABLE,
+                 <ls_alv_line> TYPE any.
+
+  DATA: lt_selected_rows       TYPE lvc_t_row,
+        ls_selected_row        TYPE lvc_s_row,
+        lv_newly_deleted_count TYPE i VALUE 0.
+  CHECK go_grid IS BOUND.
+  CALL METHOD go_grid->check_changed_data.
+  CALL METHOD go_grid->get_selected_rows
+    IMPORTING
+      et_index_rows = lt_selected_rows.
+  IF lines( lt_selected_rows ) = 0.
+    MESSAGE i009(zsap03_msg_cl).
+    RETURN.
+  ENDIF.
+  DATA: lv_answer  TYPE c,
+        lv_message TYPE string.
+
+  DATA: lv_lines_str TYPE string.
+  lv_lines_str = lines( lt_selected_rows ).
+  CONCATENATE 'Are you sure you want to delete' lv_lines_str 'selected rows?' INTO lv_message SEPARATED BY space.
+
+  CALL FUNCTION 'POPUP_TO_CONFIRM'
+    EXPORTING
+      titlebar              = 'Confirm Deletion'
+      text_question         = lv_message
+      text_button_1         = 'Yes'
+      text_button_2         = 'No'
+      default_button        = '2'
+      display_cancel_button = ''
+    IMPORTING
+      answer                = lv_answer.
+
+  CHECK lv_answer = '1'.
+
+  ASSIGN gt_alv_data->* TO <lt_alv_data>.
+  CHECK <lt_alv_data> IS ASSIGNED.
+
+  DATA: lr_temp_alv TYPE REF TO data.
+  FIELD-SYMBOLS: <lt_temp_alv> TYPE STANDARD TABLE.
+  CREATE DATA lr_temp_alv LIKE <lt_alv_data>.
+  ASSIGN lr_temp_alv->* TO <lt_temp_alv>.
+  <lt_temp_alv> = <lt_alv_data>.
+
+  LOOP AT lt_selected_rows INTO ls_selected_row.
+    READ TABLE <lt_temp_alv> ASSIGNING <ls_alv_line> INDEX ls_selected_row-index.
+    IF sy-subrc <> 0.
+      CONTINUE.
+    ENDIF.
+    ASSIGN COMPONENT 'IS_DELETED' OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_is_deleted>).
+    IF <lv_is_deleted> IS ASSIGNED AND <lv_is_deleted> <> 'X'.
+      <lv_is_deleted> = 'X'.
+      lv_newly_deleted_count = lv_newly_deleted_count + 1.
+      PERFORM add_to_deleted_data USING <ls_alv_line>.
+    ENDIF.
+  ENDLOOP.
+  <lt_alv_data> = <lt_temp_alv>.
+  IF lv_newly_deleted_count > 0.
+    " Revalidate all new rows after deletion to update colors
+    go_evt_hdlr->revalidate_all_new_rows( ).
+    PERFORM filter_and_refresh_alv.
+    DATA: lv_count_str  TYPE string, lv_result_msg TYPE string.
+    lv_count_str = lv_newly_deleted_count.
+    IF lv_newly_deleted_count = 1.
+      lv_result_msg = |Successfully deleted { lv_newly_deleted_count } row|.
+    ELSE.
+      lv_result_msg = |Successfully deleted { lv_newly_deleted_count } rows|.
+    ENDIF.
+    MESSAGE s015(zsap03_msg_cl) WITH lv_result_msg.
+    gv_data_changed = abap_true.
+    " Set save state to pending when data is deleted
+    PERFORM set_save_state_pending.
+  ELSE.
+    MESSAGE i010(zsap03_msg_cl) DISPLAY LIKE 'E'.
+  ENDIF.
+ENDFORM.
+
+FORM add_to_deleted_data USING ps_line TYPE any.
+  FIELD-SYMBOLS: <lt_deleted_data> TYPE ANY TABLE,
+                 <lt_table_data>   TYPE ANY TABLE.
+
+  IF gt_deleted_data IS NOT BOUND.
+    ASSIGN gt_table_data->* TO <lt_table_data>.
+    IF <lt_table_data> IS ASSIGNED.
+      CREATE DATA gt_deleted_data LIKE <lt_table_data>.
+    ENDIF.
+  ENDIF.
+
+  ASSIGN gt_deleted_data->* TO <lt_deleted_data>.
+  CHECK <lt_deleted_data> IS ASSIGNED.
+
+  ASSIGN COMPONENT 'IS_NEW' OF STRUCTURE ps_line TO FIELD-SYMBOL(<lv_is_new>).
+  IF sy-subrc = 0 AND <lv_is_new> = ' '.
+
+    DATA: lo_clean_data TYPE REF TO data.
+    FIELD-SYMBOLS: <ls_clean_line> TYPE any.
+
+    ASSIGN gt_table_data->* TO <lt_table_data>.
+    IF <lt_table_data> IS ASSIGNED.
+      CREATE DATA lo_clean_data LIKE LINE OF <lt_table_data>.
+      ASSIGN lo_clean_data->* TO <ls_clean_line>.
+
+      IF <ls_clean_line> IS ASSIGNED.
+        LOOP AT gt_fieldcat ASSIGNING FIELD-SYMBOL(<ls_fcat>)
+          WHERE fieldname <> 'IS_NEW'
+            AND fieldname <> 'IS_DELETED'
+            AND fieldname <> 'CELLTAB'
+            AND fieldname <> 'STATUS'.
+
+          ASSIGN COMPONENT <ls_fcat>-fieldname OF STRUCTURE ps_line TO FIELD-SYMBOL(<lv_source>).
+          ASSIGN COMPONENT <ls_fcat>-fieldname OF STRUCTURE <ls_clean_line> TO FIELD-SYMBOL(<lv_target>).
+
+          IF <lv_source> IS ASSIGNED AND <lv_target> IS ASSIGNED.
+            <lv_target> = <lv_source>.
+          ENDIF.
+        ENDLOOP.
+        INSERT <ls_clean_line> INTO TABLE <lt_deleted_data>.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Forms for handling exit scenarios
+*&---------------------------------------------------------------------*
+
+FORM confirm_before_exit.
+  IF gv_data_changed = abap_true.
+    PERFORM handle_exit_with_changes.
+  ELSE.
+    PERFORM handle_exit_no_changes.
+  ENDIF.
+ENDFORM.
+
+FORM handle_exit_with_changes.
+
+  DATA: lv_answer TYPE c.
+  CALL FUNCTION 'POPUP_TO_CONFIRM'
+    EXPORTING
+      titlebar              = 'Data Changed'
+      text_question         = 'Do you want to save changes before exit?'
+      text_button_1         = 'Save & Exit'
+      text_button_2         = 'Don''t Save'
+      default_button        = '1'
+      display_cancel_button = ''
+    IMPORTING
+      answer                = lv_answer.
+
+  CASE lv_answer.
+    WHEN '1'.
+      PERFORM save_data.
+      CHECK sy-msgty <> 'E'.
+      LEAVE TO SCREEN 0.
+
+    WHEN '2'.
+      PERFORM confirm_data_loss.
+  ENDCASE.
+ENDFORM.
+
+FORM confirm_data_loss.
+
+  DATA: lv_answer TYPE c.
+
+  CALL FUNCTION 'POPUP_TO_CONFIRM'
+    EXPORTING
+      titlebar              = 'Warning'
+      text_question         = 'Changed data will be lost. Are you sure you want to exit?'
+      text_button_1         = 'Yes, Exit'
+      text_button_2         = 'Stay'
+      default_button        = '2'
+      display_cancel_button = ''
+    IMPORTING
+      answer                = lv_answer.
+
+  CHECK lv_answer = '1'.
+  LEAVE TO SCREEN 0.
+ENDFORM.
+
+FORM handle_exit_no_changes.
+  DATA: lv_answer TYPE c.
+
+  CALL FUNCTION 'POPUP_TO_CONFIRM'
+    EXPORTING
+      titlebar              = 'Confirm Exit'
+      text_question         = 'Are you sure you want to exit?'
+      text_button_1         = 'Yes'
+      text_button_2         = 'No'
+      default_button        = '2'
+      display_cancel_button = ''
+    IMPORTING
+      answer                = lv_answer.
+
+  CHECK lv_answer = '1'.
+  LEAVE TO SCREEN 0.
+ENDFORM.
+
+
+
+*&---------------------------------------------------------------------*
+*& Form process_insert_row
+*&---------------------------------------------------------------------*
+FORM process_insert_row USING ps_table_line TYPE any
+                              pv_row_index TYPE i
+                       CHANGING pv_success_count TYPE i
+                                pv_insert_count TYPE i
+                                pv_error_count TYPE i
+                                pt_row_results TYPE gty_success_flags
+                                pv_error_messages TYPE string.
+  DATA: lv_duplicate_found TYPE abap_bool,
+        lv_error_msg       TYPE string.
+
+  PERFORM check_single_row_vs_db_silent
+    USING ps_table_line pv_row_index
+    CHANGING lv_duplicate_found.
+
+  IF lv_duplicate_found = abap_true.
+    lv_error_msg = |Row { pv_row_index }: Primary key already exists|.
+    PERFORM log_error USING lv_error_msg CHANGING pv_error_count pt_row_results pv_error_messages.
+    PERFORM mark_row_error USING pv_row_index.
+    RETURN.
+  ENDIF.
+  INSERT (p_table) FROM ps_table_line.
+
+  IF sy-subrc = 0.
+    COMMIT WORK AND WAIT.
+    pv_success_count = pv_success_count + 1.
+    pv_insert_count = pv_insert_count + 1.
+    APPEND abap_true TO pt_row_results.
+  ELSE.
+    ROLLBACK WORK.
+    lv_error_msg = |Row { pv_row_index }: INSERT error (sy-subrc={ sy-subrc })|.
+    PERFORM log_error USING lv_error_msg CHANGING pv_error_count pt_row_results pv_error_messages.
+    PERFORM mark_row_error USING pv_row_index.
+  ENDIF.
+ENDFORM.
+
+FORM process_update_row USING ps_table_line TYPE any
+                              pv_row_index TYPE i
+                       CHANGING pv_success_count TYPE i
+                                pv_update_count TYPE i
+                                pv_error_count TYPE i
+                                pt_row_results TYPE gty_success_flags
+                                pv_error_messages TYPE string.
+  DATA: lv_error_msg TYPE string.
+  UPDATE (p_table) FROM ps_table_line.
+  IF sy-subrc = 0 AND sy-dbcnt > 0.
+    COMMIT WORK AND WAIT.
+    pv_success_count = pv_success_count + 1.
+    pv_update_count = pv_update_count + 1.
+    APPEND abap_true TO pt_row_results.
+  ELSE.
+    ROLLBACK WORK.
+
+    IF sy-dbcnt = 0.
+      lv_error_msg = |Row { pv_row_index }: No row found to update|.
+    ELSE.
+      lv_error_msg = |Row { pv_row_index }: Update error (sy-subrc={ sy-subrc })|.
+    ENDIF.
+
+    PERFORM log_error USING lv_error_msg CHANGING pv_error_count pt_row_results pv_error_messages.
+    PERFORM mark_row_error USING pv_row_index.
+  ENDIF.
+ENDFORM.
+
+FORM log_error USING pv_error_msg TYPE string
+              CHANGING pv_error_count TYPE i
+                       pt_row_results TYPE gty_success_flags
+                       pv_error_messages TYPE string.
+  pv_error_count = pv_error_count + 1.
+  APPEND abap_false TO pt_row_results.
+
+  IF pv_error_messages IS INITIAL.
+    pv_error_messages = pv_error_msg.
+  ELSE.
+    pv_error_messages = |{ pv_error_messages }; { pv_error_msg }|.
+  ENDIF.
+ENDFORM.
+
+FORM mark_row_error USING pv_row_index TYPE i.
+  FIELD-SYMBOLS: <lt_alv_data> TYPE ANY TABLE,
+                 <ls_alv_line> TYPE any.
+
+  ASSIGN gt_alv_data->* TO <lt_alv_data>.
+  CHECK <lt_alv_data> IS ASSIGNED.
+
+  DATA(lv_counter) = 0.
+  LOOP AT <lt_alv_data> ASSIGNING <ls_alv_line>.
+    lv_counter = lv_counter + 1.
+    IF lv_counter = pv_row_index.
+      ASSIGN COMPONENT 'IS_ERROR' OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_is_error>).
+      IF sy-subrc = 0.
+        <lv_is_error> = 'X'.
+      ENDIF.
+      EXIT.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.
+
+FORM update_fcat_protection.
+  DATA: lt_dd03l TYPE TABLE OF dd03l.
+  PERFORM get_primary_key_fields CHANGING lt_dd03l.
+  LOOP AT gt_fieldcat ASSIGNING FIELD-SYMBOL(<ls_fcat>).
+    READ TABLE lt_dd03l TRANSPORTING NO FIELDS
+      WITH KEY tabname = p_table
+               fieldname = <ls_fcat>-fieldname
+               keyflag = 'X'.
+
+    IF sy-subrc = 0 OR <ls_fcat>-fieldname = 'MANDT'.
+      <ls_fcat>-key = abap_true.
+    ENDIF.
+    IF gv_mode = c_mode_display.
+      <ls_fcat>-edit = abap_false.
+    ELSE.
+      <ls_fcat>-edit = abap_true.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.
+
+FORM set_color.
+  FIELD-SYMBOLS: <lt_alv_data> TYPE ANY TABLE,
+                 <ls_alv_line> TYPE any.
+
+  ASSIGN gt_alv_data->* TO <lt_alv_data>.
+  CHECK <lt_alv_data> IS ASSIGNED.
+
+  LOOP AT <lt_alv_data> ASSIGNING <ls_alv_line>.
+    ASSIGN COMPONENT 'IS_DELETED' OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_is_deleted>).
+    ASSIGN COMPONENT 'IS_ERROR' OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_is_error>).
+    ASSIGN COMPONENT 'IS_NEW' OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_is_new>).
+    ASSIGN COMPONENT 'ROW_COLOR' OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_row_color>).
+
+    CHECK <lv_row_color> IS ASSIGNED.
+    IF <lv_is_deleted> IS ASSIGNED AND <lv_is_deleted> = 'X'.
+      <lv_row_color> = 'C700'.  " Gray for deleted
+    ELSEIF <lv_is_error> IS ASSIGNED AND <lv_is_error> = 'X'.
+      <lv_row_color> = 'C600'.  " Red for error
+    ELSEIF <lv_is_new> IS ASSIGNED AND <lv_is_new> = 'X'.
+      <lv_row_color> = 'C510'.  " Green for new
+    ELSE.
+      CLEAR <lv_row_color>.  " Normal color
+    ENDIF.
+  ENDLOOP.
+ENDFORM.
+
+FORM refresh_alv_after_save.
+  FIELD-SYMBOLS: <lt_alv_data> TYPE ANY TABLE,
+                 <ls_alv_line> TYPE any.
+  ASSIGN gt_alv_data->* TO <lt_alv_data>.
+  IF <lt_alv_data> IS ASSIGNED.
+    DATA: lv_error_rows TYPE i VALUE 0.
+    LOOP AT <lt_alv_data> ASSIGNING <ls_alv_line>.
+      ASSIGN COMPONENT 'IS_ERROR' OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_check_error>).
+      IF <lv_check_error> IS ASSIGNED AND <lv_check_error> = 'X'.
+        lv_error_rows = lv_error_rows + 1.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+  PERFORM set_color.
+  PERFORM set_cell_styles.
+  gv_title_updated = abap_false.
+  PERFORM update_alv_title.
+  IF go_grid IS BOUND.
+    CALL METHOD go_grid->set_frontend_layout
+      EXPORTING
+        is_layout = gs_layout.
+
+    CALL METHOD go_grid->refresh_table_display
+      EXPORTING
+        is_stable = VALUE #( row = abap_true col = abap_true ).
+  ENDIF.
+ENDFORM.
+
+
+
+*&---------------------------------------------------------------------*
+*& Form check_data_changes_for_save
+*&---------------------------------------------------------------------*
+FORM check_data_changes_for_save CHANGING cv_has_changes TYPE abap_bool.
+  FIELD-SYMBOLS: <lt_alv_data>      TYPE ANY TABLE,
+                 <lt_original_data> TYPE ANY TABLE,
+                 <ls_alv_line>      TYPE any.
+
+  cv_has_changes = abap_false.
+  ASSIGN gt_alv_data->* TO <lt_alv_data>.
+  ASSIGN gt_table_data->* TO <lt_original_data>.
+
+  CHECK <lt_alv_data> IS ASSIGNED AND <lt_original_data> IS ASSIGNED.
+  DATA: lv_alv_lines  TYPE i, lv_orig_lines TYPE i.
+  DESCRIBE TABLE <lt_alv_data> LINES lv_alv_lines.
+  DESCRIBE TABLE <lt_original_data> LINES lv_orig_lines.
+  LOOP AT <lt_alv_data> ASSIGNING <ls_alv_line>.
+    ASSIGN COMPONENT 'IS_NEW' OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_is_new>).
+    IF <lv_is_new> IS ASSIGNED AND <lv_is_new> = 'X'.
+      cv_has_changes = abap_true.
+      RETURN.
+    ENDIF.
+    ASSIGN COMPONENT 'IS_DELETED' OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_is_deleted>).
+    IF <lv_is_deleted> IS ASSIGNED AND <lv_is_deleted> = 'X'.
+      cv_has_changes = abap_true.
+      RETURN.
+    ENDIF.
+    IF <lv_is_new> IS ASSIGNED AND <lv_is_new> = ' '.
+      DATA: lr_table_line_check TYPE REF TO data.
+      FIELD-SYMBOLS: <ls_table_line_check> TYPE any.
+
+      CREATE DATA lr_table_line_check TYPE (p_table).
+      ASSIGN lr_table_line_check->* TO <ls_table_line_check>.
+
+      IF <ls_table_line_check> IS ASSIGNED.
+        LOOP AT gt_fieldcat INTO DATA(ls_fcat_check) WHERE fieldname <> 'IS_NEW'
+                                                      AND fieldname <> 'IS_DELETED'
+                                                      AND fieldname <> 'IS_ERROR'
+                                                      AND fieldname <> 'ROW_COLOR'
+                                                      AND fieldname <> 'CELLTAB'.
+          ASSIGN COMPONENT ls_fcat_check-fieldname OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_alv_field_check>).
+          ASSIGN COMPONENT ls_fcat_check-fieldname OF STRUCTURE <ls_table_line_check> TO FIELD-SYMBOL(<lv_table_field_check>).
+
+          IF <lv_alv_field_check> IS ASSIGNED AND <lv_table_field_check> IS ASSIGNED.
+            <lv_table_field_check> = <lv_alv_field_check>.
+          ENDIF.
+        ENDLOOP.
+        DATA: lv_row_changed TYPE abap_bool.
+        PERFORM check_alv_vs_database USING <ls_table_line_check>
+                                     CHANGING lv_row_changed.
+        IF lv_row_changed = abap_true.
+          cv_has_changes = abap_true.
+          RETURN.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+  IF gt_deleted_data IS BOUND.
+    FIELD-SYMBOLS: <lt_deleted_data> TYPE ANY TABLE.
+    ASSIGN gt_deleted_data->* TO <lt_deleted_data>.
+    IF <lt_deleted_data> IS ASSIGNED AND <lt_deleted_data> IS NOT INITIAL.
+      cv_has_changes = abap_true.
+      RETURN.
+    ENDIF.
+  ENDIF.
+  cv_has_changes = abap_false.
+ENDFORM.
+
+FORM check_single_row_vs_db_silent USING ps_table_line TYPE any
+                                          pv_row_index TYPE i
+                                   CHANGING cv_duplicate_found TYPE abap_bool.
+  DATA: lr_check_record    TYPE REF TO data,
+        lv_where_condition TYPE string,
+        lt_key_fcat        TYPE lvc_t_fcat,
+        ls_key_fcat        TYPE lvc_s_fcat.
+
+  FIELD-SYMBOLS: <ls_check_record> TYPE any,
+                 <lt_alv>          TYPE STANDARD TABLE,
+                 <lt_db_data>      TYPE STANDARD TABLE.
+
+  cv_duplicate_found = abap_false.
+
+  " Get key field catalog
+  LOOP AT gt_fieldcat INTO ls_key_fcat WHERE key = abap_true AND fieldname <> 'MANDT'.
+    APPEND ls_key_fcat TO lt_key_fcat.
+  ENDLOOP.
+
+  CHECK lt_key_fcat IS NOT INITIAL.
+
+  " Assign ALV and database data
+  ASSIGN gt_alv_data->* TO <lt_alv>.
+  CHECK <lt_alv> IS ASSIGNED.
+
+  ASSIGN gt_table_data->* TO <lt_db_data>.
+  CHECK <lt_db_data> IS ASSIGNED.
+
+  " Check for duplicates in database
+  LOOP AT <lt_db_data> ASSIGNING FIELD-SYMBOL(<ls_db_row>).
+    DATA(lv_db_match) = abap_true.
+    LOOP AT lt_key_fcat INTO ls_key_fcat.
+      ASSIGN COMPONENT ls_key_fcat-fieldname OF STRUCTURE ps_table_line TO FIELD-SYMBOL(<lv_new_key>).
+      ASSIGN COMPONENT ls_key_fcat-fieldname OF STRUCTURE <ls_db_row> TO FIELD-SYMBOL(<lv_db_key>).
+
+      IF <lv_new_key> IS ASSIGNED AND <lv_db_key> IS ASSIGNED.
+        DATA(lv_new_str) = to_upper( |{ <lv_new_key> }| ).
+        DATA(lv_db_str) = to_upper( |{ <lv_db_key> }| ).
+        IF lv_new_str <> lv_db_str.
+          lv_db_match = abap_false.
+          EXIT.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+
+    IF lv_db_match = abap_true.
+
+      " If we find a match here, it means the record still exists and is not deleted
+      cv_duplicate_found = abap_true.
+      RETURN.
+    ENDIF.
+  ENDLOOP.
+
+  " If no duplicate in database, check other ALV rows
+  " For new rows: only check previous rows (first come first served)
+  DATA: lv_current_row_index TYPE i.
+  LOOP AT <lt_alv> ASSIGNING FIELD-SYMBOL(<ls_other_row>).
+    lv_current_row_index = sy-tabix.
+
+    " Skip self-comparison (avoid comparing row with itself)
+    IF lv_current_row_index = pv_row_index.
+      CONTINUE.
+    ENDIF.
+
+    " For new rows during save, only check against previous rows in the ALV
+    " This ensures "first come first served" - earlier rows get saved first
+    IF lv_current_row_index > pv_row_index.
+      CONTINUE.
+    ENDIF.
+
+    " Skip deleted rows
+    ASSIGN COMPONENT 'IS_DELETED' OF STRUCTURE <ls_other_row> TO FIELD-SYMBOL(<lv_del_flag>).
+    IF <lv_del_flag> IS ASSIGNED AND <lv_del_flag> = 'X'.
+      CONTINUE.
+    ENDIF.
+
+    " Compare key fields
+    DATA(lv_alv_match) = abap_true.
+    LOOP AT lt_key_fcat INTO ls_key_fcat.
+      ASSIGN COMPONENT ls_key_fcat-fieldname OF STRUCTURE ps_table_line TO <lv_new_key>.
+      ASSIGN COMPONENT ls_key_fcat-fieldname OF STRUCTURE <ls_other_row> TO FIELD-SYMBOL(<lv_other_key>).
+
+      IF <lv_new_key> IS ASSIGNED AND <lv_other_key> IS ASSIGNED.
+        lv_new_str = to_upper( |{ <lv_new_key> }| ).
+        DATA(lv_other_str) = to_upper( |{ <lv_other_key> }| ).
+        IF lv_new_str <> lv_other_str.
+          lv_alv_match = abap_false.
+          EXIT.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+
+    IF lv_alv_match = abap_true.
+      cv_duplicate_found = abap_true.
+      RETURN.
+    ENDIF.
+  ENDLOOP.
+
+  cv_duplicate_found = abap_false.
+ENDFORM.
+
+
+
+
+
+
+FORM update_success_flags USING pt_row_results TYPE gty_success_flags.
+  FIELD-SYMBOLS: <lt_alv_data> TYPE ANY TABLE,
+                 <ls_alv_line> TYPE any.
+
+  ASSIGN gt_alv_data->* TO <lt_alv_data>.
+  CHECK <lt_alv_data> IS ASSIGNED.
+
+  DATA: lv_result_counter TYPE i VALUE 0.
+
+  LOOP AT <lt_alv_data> ASSIGNING <ls_alv_line>.
+    ASSIGN COMPONENT 'IS_DELETED' OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_is_deleted>).
+    IF <lv_is_deleted> IS ASSIGNED AND <lv_is_deleted> = 'X'.
+      CONTINUE.
+    ENDIF.
+    ASSIGN COMPONENT 'IS_ERROR' OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_is_error_flag>).
+    IF <lv_is_error_flag> IS ASSIGNED AND <lv_is_error_flag> = 'X'.
+      CONTINUE.
+    ENDIF.
+    ASSIGN COMPONENT 'IS_NEW' OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_is_new>).
+    DATA: lv_was_processed TYPE abap_bool VALUE abap_false.
+
+    IF <lv_is_new> IS ASSIGNED AND <lv_is_new> = 'X'.
+      lv_was_processed = abap_true.
+    ELSE.
+      DATA: lr_check_line TYPE REF TO data.
+      FIELD-SYMBOLS: <ls_check_line> TYPE any.
+
+      CREATE DATA lr_check_line TYPE (p_table).
+      ASSIGN lr_check_line->* TO <ls_check_line>.
+
+      IF <ls_check_line> IS ASSIGNED.
+        LOOP AT gt_fieldcat INTO DATA(ls_fcat_flag) WHERE fieldname <> 'IS_NEW'
+                                                     AND fieldname <> 'IS_DELETED'
+                                                     AND fieldname <> 'IS_ERROR'
+                                                     AND fieldname <> 'ROW_COLOR'
+                                                     AND fieldname <> 'CELLTAB'.
+          ASSIGN COMPONENT ls_fcat_flag-fieldname OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_alv_field_flag>).
+          ASSIGN COMPONENT ls_fcat_flag-fieldname OF STRUCTURE <ls_check_line> TO FIELD-SYMBOL(<lv_check_field>).
+
+          IF <lv_alv_field_flag> IS ASSIGNED AND <lv_check_field> IS ASSIGNED.
+            <lv_check_field> = <lv_alv_field_flag>.
+          ENDIF.
+        ENDLOOP.
+        DATA: lv_has_change TYPE abap_bool.
+        PERFORM check_alv_vs_database USING <ls_check_line>
+                                     CHANGING lv_has_change.
+        lv_was_processed = lv_has_change.
+      ENDIF.
+    ENDIF.
+    IF lv_was_processed = abap_true.
+      lv_result_counter = lv_result_counter + 1.
+      READ TABLE pt_row_results INTO DATA(lv_row_result) INDEX lv_result_counter.
+      IF sy-subrc = 0.
+        IF lv_row_result = abap_true.
+          ASSIGN COMPONENT 'IS_ERROR' OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_is_error>).
+          IF <lv_is_error> IS ASSIGNED.
+            <lv_is_error> = ' '.
+          ENDIF.
+          IF <lv_is_new> IS ASSIGNED AND <lv_is_new> = 'X'.
+            <lv_is_new> = ' '.
+          ENDIF.
+        ELSE.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.
+
+
+
+FORM check_alv_vs_original USING ps_alv_line TYPE any
+                                 pt_original_data TYPE ANY TABLE
+                          CHANGING cv_changed TYPE abap_bool.
+
+  FIELD-SYMBOLS: <ls_original_line> TYPE any,
+                 <ls_clean_alv>     TYPE any.
+
+  cv_changed = abap_false.
+
+  IF pt_original_data IS INITIAL.
+    cv_changed = abap_true.
+    RETURN.
+  ENDIF.
+
+  ASSIGN COMPONENT 'IS_NEW' OF STRUCTURE ps_alv_line TO FIELD-SYMBOL(<lv_check_is_new>).
+  IF <lv_check_is_new> IS ASSIGNED AND <lv_check_is_new> = 'X'.
+    cv_changed = abap_true.
+    RETURN.
+  ENDIF.
+
+  DATA: lo_clean_data TYPE REF TO data.
+  CREATE DATA lo_clean_data LIKE LINE OF pt_original_data.
+  ASSIGN lo_clean_data->* TO <ls_clean_alv>.
+
+  LOOP AT gt_fieldcat ASSIGNING FIELD-SYMBOL(<ls_field>)
+    WHERE fieldname <> 'IS_NEW'
+      AND fieldname <> 'IS_DELETED'
+      AND fieldname <> 'CELLTAB'
+      AND fieldname <> 'ROW_COLOR'
+      AND fieldname <> 'STATUS'
+      AND fieldname <> 'IS_ERROR'.
+
+    ASSIGN COMPONENT <ls_field>-fieldname OF STRUCTURE ps_alv_line TO FIELD-SYMBOL(<lv_alv_value>).
+    ASSIGN COMPONENT <ls_field>-fieldname OF STRUCTURE <ls_clean_alv> TO FIELD-SYMBOL(<lv_clean_value>).
+
+    IF <lv_alv_value> IS ASSIGNED AND <lv_clean_value> IS ASSIGNED.
+      <lv_clean_value> = <lv_alv_value>.
+    ENDIF.
+  ENDLOOP.
+
+  LOOP AT pt_original_data ASSIGNING <ls_original_line>.
+    IF <ls_clean_alv> = <ls_original_line>.
+      cv_changed = abap_false.
+      RETURN.
+    ENDIF.
+  ENDLOOP.
+
+  cv_changed = abap_true.
+ENDFORM.
+
+FORM quick_check_has_real_changes CHANGING cv_has_changes TYPE abap_bool.
+  "*--------------------------------------------------------------------*
+  "* Quick check to see if there are any real data changes
+  "* Returns true only if there are actual meaningful changes
+  "*--------------------------------------------------------------------*
+  FIELD-SYMBOLS: <lt_alv_data>      TYPE ANY TABLE,
+                 <lt_original_data> TYPE ANY TABLE,
+                 <ls_alv_line>      TYPE any.
+
+  cv_has_changes = abap_false.
+
+  ASSIGN gt_alv_data->* TO <lt_alv_data>.
+  ASSIGN gt_table_data->* TO <lt_original_data>.
+
+  CHECK <lt_alv_data> IS ASSIGNED AND <lt_original_data> IS ASSIGNED.
+
+  " Check if number of non-deleted rows changed
+  DATA: lv_alv_active_count TYPE i,
+        lv_original_count   TYPE i.
+
+  " Count active ALV rows (non-deleted)
+  LOOP AT <lt_alv_data> ASSIGNING <ls_alv_line>.
+    ASSIGN COMPONENT 'IS_DELETED' OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_is_deleted>).
+    CHECK <lv_is_deleted> IS NOT ASSIGNED OR <lv_is_deleted> <> 'X'.
+    lv_alv_active_count = lv_alv_active_count + 1.
+  ENDLOOP.
+
+  DESCRIBE TABLE <lt_original_data> LINES lv_original_count.
+
+  " If count differs, there are changes
+  IF lv_alv_active_count <> lv_original_count.
+    cv_has_changes = abap_true.
+    RETURN.
+  ENDIF.
+
+  " Check each ALV row for changes
+  LOOP AT <lt_alv_data> ASSIGNING <ls_alv_line>.
+    " Skip deleted rows
+    ASSIGN COMPONENT 'IS_DELETED' OF STRUCTURE <ls_alv_line> TO <lv_is_deleted>.
+    CHECK <lv_is_deleted> IS NOT ASSIGNED OR <lv_is_deleted> <> 'X'.
+
+    " Check if this is a new row
+    ASSIGN COMPONENT 'IS_NEW' OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_is_new>).
+    IF <lv_is_new> IS ASSIGNED AND <lv_is_new> = 'X'.
+      " Check if it's a meaningful new row (has key fields filled)
+      DATA(lv_has_key_data) = abap_false.
+      LOOP AT gt_fieldcat INTO DATA(ls_fcat) WHERE key = abap_true AND fieldname <> 'MANDT'.
+        ASSIGN COMPONENT ls_fcat-fieldname OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_key_val>).
+        IF <lv_key_val> IS ASSIGNED AND <lv_key_val> IS NOT INITIAL.
+          lv_has_key_data = abap_true.
+          EXIT.
+        ENDIF.
+      ENDLOOP.
+      IF lv_has_key_data = abap_true.
+        cv_has_changes = abap_true.
+        RETURN.
+      ENDIF.
+    ELSE.
+      " Existing row - check if modified
+      DATA: lv_row_changed TYPE abap_bool.
+      PERFORM check_alv_vs_original USING <ls_alv_line> <lt_original_data>
+                                   CHANGING lv_row_changed.
+      IF lv_row_changed = abap_true.
+        cv_has_changes = abap_true.
+        RETURN.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.
+
+FORM download_data_to_excel USING p_table TYPE tabname.
+  DATA: lxtring    TYPE xstring,
+        lv_message TYPE string.
+  DATA: gt_excel    TYPE REF TO data.
+  DATA: gt_fcat     TYPE lvc_t_fcat.
+
+  CALL FUNCTION 'LVC_FIELDCATALOG_MERGE'
+    EXPORTING
+      i_structure_name       = p_table
+      i_client_never_display = 'X'
+    CHANGING
+      ct_fieldcat            = gt_fcat
+    EXCEPTIONS
+      inconsistent_interface = 1
+      program_error          = 2
+      OTHERS                 = 3.
+
+  IF sy-subrc <> 0.
+    CASE sy-subrc.
+      WHEN 1.
+        MESSAGE e050(zsap03_msg_cl) WITH p_table INTO lv_message.
+      WHEN 2.
+        MESSAGE e051(zsap03_msg_cl) INTO lv_message.
+      WHEN 3.
+        MESSAGE e052(zsap03_msg_cl) INTO lv_message.
+    ENDCASE.
+    MESSAGE lv_message TYPE 'E'.
+    RETURN.
+  ENDIF.
+
+  cl_alv_table_create=>create_dynamic_table(
+    EXPORTING
+      it_fieldcatalog           = gt_fcat
+    IMPORTING
+      ep_table                  = gt_excel
+    EXCEPTIONS
+      generate_subpool_dir_full = 1
+      OTHERS                    = 2
+  ).
+
+  IF sy-subrc <> 0.
+    CASE sy-subrc.
+      WHEN 1.
+        MESSAGE e053(zsap03_msg_cl) INTO lv_message.
+      WHEN 2.
+        MESSAGE e054(zsap03_msg_cl) INTO lv_message.
+    ENDCASE.
+    MESSAGE lv_message TYPE 'E'.
+    RETURN.
+  ENDIF.
+
+  ASSIGN gt_alv_data->* TO <gt_alv_data>.
+  IF <gt_alv_data> IS NOT ASSIGNED.
+    MESSAGE e055(zsap03_msg_cl) INTO lv_message.
+    MESSAGE lv_message TYPE 'E'.
+    RETURN.
+  ENDIF.
+
+  MOVE-CORRESPONDING <gt_alv_data> TO gt_excel->*.
+
+  DATA: ldt_col TYPE if_fdt_doc_spreadsheet=>t_column.
+
+  TRY.
+      cl_fdt_xl_spreadsheet=>if_fdt_doc_spreadsheet~create_document(
+        EXPORTING
+          columns       = ldt_col
+          itab          = gt_excel
+          iv_call_type  = 1
+          iv_sheet_name = 'Data'
+        RECEIVING
+          xdocument     = lxtring
+      ).
+    CATCH cx_root INTO DATA(lx_error).
+      lv_message = lx_error->get_text( ).
+      MESSAGE e056(zsap03_msg_cl) WITH lv_message INTO lv_message.
+      MESSAGE lv_message TYPE 'E'.
+      RETURN.
+  ENDTRY.
+
+  DATA: ldf_filename TYPE string,
+        ldf_path     TYPE string,
+        ldf_fullpath TYPE string,
+        ldf_action   TYPE i.
+
+  cl_gui_frontend_services=>file_save_dialog(
+    EXPORTING
+      default_extension = 'xlsx'
+      default_file_name = |Data_{ p_table }_{ sy-datum }_{ sy-uzeit }.xlsx|
+      file_filter       = cl_gui_frontend_services=>filetype_excel
+    CHANGING
+      filename          = ldf_filename
+      path              = ldf_path
+      fullpath          = ldf_fullpath
+      user_action       = ldf_action
+    EXCEPTIONS
+      cntl_error        = 1
+      error_no_gui      = 2
+      OTHERS            = 3
+  ).
+
+  IF sy-subrc <> 0.
+    CASE sy-subrc.
+      WHEN 1.
+        MESSAGE e057(zsap03_msg_cl) INTO lv_message.
+      WHEN 2.
+        MESSAGE e058(zsap03_msg_cl) INTO lv_message.
+      WHEN 3.
+        MESSAGE e059(zsap03_msg_cl) INTO lv_message.
+    ENDCASE.
+    MESSAGE lv_message TYPE 'E'.
+    RETURN.
+  ENDIF.
+
+  IF ldf_action = cl_gui_frontend_services=>action_ok.
+    DATA: ldt_solix   TYPE solix_tab,
+          ldf_linsize TYPE i.
+
+    ldf_linsize = xstrlen( lxtring ).
+    ldt_solix = cl_bcs_convert=>xstring_to_solix( iv_xstring = lxtring ).
+
+    cl_gui_frontend_services=>gui_download(
+      EXPORTING
+        bin_filesize            = ldf_linsize
+        filename                = ldf_fullpath
+        filetype                = 'BIN'
+      CHANGING
+        data_tab                = ldt_solix
+      EXCEPTIONS
+        file_write_error        = 1
+        no_batch                = 2
+        gui_refuse_filetransfer = 3
+        invalid_type            = 4
+        no_authority            = 5
+        unknown_error           = 6
+        header_not_allowed      = 7
+        separator_not_allowed   = 8
+        filesize_not_allowed    = 9
+        header_too_long         = 10
+        dp_error_create         = 11
+        dp_error_send           = 12
+        dp_error_write          = 13
+        unknown_dp_error        = 14
+        access_denied           = 15
+        dp_out_of_memory        = 16
+        disk_full               = 17
+        dp_timeout              = 18
+        file_not_found          = 19
+        dataprovider_exception  = 20
+        control_flush_error     = 21
+        not_supported_by_gui    = 22
+        error_no_gui            = 23
+        OTHERS                  = 24
+    ).
+
+    IF sy-subrc <> 0.
+      MESSAGE e060(zsap03_msg_cl) WITH sy-subrc INTO lv_message.
+      MESSAGE lv_message TYPE 'E'.
+      RETURN.
+    ELSE.
+      MESSAGE s061(zsap03_msg_cl) WITH ldf_fullpath INTO lv_message.
+      MESSAGE lv_message TYPE 'S'.
+    ENDIF.
+  ENDIF.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form generate_excel_xstring
+*&---------------------------------------------------------------------*
+*& Create Excel for Attachment in Email
+*&---------------------------------------------------------------------*
+FORM generate_excel_xstring USING ir_data TYPE REF TO data
+                                  it_fcat TYPE lvc_t_fcat
+                            CHANGING cv_xstring TYPE xstring.
+
+  DATA: lr_excel TYPE REF TO data.
+  FIELD-SYMBOLS:
+    <lt_excel>  TYPE ANY TABLE,
+    <lt_source> TYPE ANY TABLE.
+
+  cl_alv_table_create=>create_dynamic_table(
+    EXPORTING
+      it_fieldcatalog           = it_fcat
+    IMPORTING
+      ep_table                  = lr_excel
+    EXCEPTIONS
+      generate_subpool_dir_full = 1
+      OTHERS                    = 2
+  ).
+  IF sy-subrc <> 0.
+    MESSAGE e084(zsap03_msg_cl).
+    RETURN.
+  ENDIF.
+
+  ASSIGN lr_excel->* TO <lt_excel>.
+  ASSIGN ir_data->* TO <lt_source>.
+
+  IF <lt_excel> IS ASSIGNED AND <lt_source> IS ASSIGNED.
+    MOVE-CORRESPONDING <lt_source> TO <lt_excel>.
+  ELSE.
+    MESSAGE e085(zsap03_msg_cl).
+    RETURN.
+  ENDIF.
+
+  DATA: ldt_col TYPE if_fdt_doc_spreadsheet=>t_column.
+
+  cl_fdt_xl_spreadsheet=>if_fdt_doc_spreadsheet~create_document(
+    EXPORTING
+      columns       = ldt_col
+      itab          = lr_excel
+      iv_call_type  = 1
+      iv_sheet_name = 'Data'
+    RECEIVING
+      xdocument     = cv_xstring
+  ).
+
+  IF cv_xstring IS INITIAL.
+    MESSAGE e086(zsap03_msg_cl).
+  ENDIF.
+ENDFORM.
+
+FORM download_excel_template USING p_table TYPE tabname.
+  DATA: lt_fields TYPE STANDARD TABLE OF dfies,
+        ls_field  TYPE dfies,
+        lv_index  TYPE i VALUE 1,
+        lt_dd03l  TYPE TABLE OF dd03l.
+
+  DATA: lv_filename TYPE string,
+        lv_path     TYPE string,
+        lv_fullpath TYPE string,
+        lv_action   TYPE i.
+
+  CALL FUNCTION 'DDIF_FIELDINFO_GET'
+    EXPORTING
+      tabname   = p_table
+      langu     = sy-langu
+    TABLES
+      dfies_tab = lt_fields
+    EXCEPTIONS
+      not_found = 1
+      OTHERS    = 2.
+
+  IF sy-subrc <> 0 OR lt_fields IS INITIAL.
+    MESSAGE e062(zsap03_msg_cl) WITH p_table.
+    RETURN.
+  ENDIF.
+
+  SELECT tabname, fieldname, keyflag, as4vers
+    FROM dd03l
+    INTO TABLE @lt_dd03l
+    WHERE tabname = @p_table
+      AND as4vers = '0000'
+      AND keyflag = 'X'.
+
+  DATA: lv_default_name TYPE string.
+  CONCATENATE p_table '_Template_' sy-datum '_' sy-uzeit INTO lv_default_name.
+
+  cl_gui_frontend_services=>file_save_dialog(
+    EXPORTING
+      window_title      = 'Save file Excel template'
+      default_extension = 'xlsx'
+      default_file_name = lv_default_name
+      file_filter       = 'Excel Files (*.xlsx)|*.xlsx|'
+    CHANGING
+      filename          = lv_filename
+      path              = lv_path
+      fullpath          = lv_fullpath
+      user_action       = lv_action
+  ).
+
+  IF lv_action <> cl_gui_frontend_services=>action_ok OR lv_fullpath IS INITIAL.
+    MESSAGE s063(zsap03_msg_cl).
+    RETURN.
+  ENDIF.
+
+  IF NOT lv_fullpath CS '.xlsx'.
+    CONCATENATE lv_fullpath '.xlsx' INTO lv_fullpath.
+  ENDIF.
+
+  DATA: lo_excel     TYPE ole2_object,
+        lo_workbooks TYPE ole2_object,
+        lo_workbook  TYPE ole2_object,
+        lo_sheets    TYPE ole2_object,
+        lo_sheet1    TYPE ole2_object,
+        lo_sheet2    TYPE ole2_object,
+        lo_range     TYPE ole2_object,
+        lo_interior  TYPE ole2_object,
+        lo_font      TYPE ole2_object.
+
+  CREATE OBJECT lo_excel 'Excel.Application'.
+  SET PROPERTY OF lo_excel 'Visible' = 1.
+
+  CALL METHOD OF lo_excel 'Workbooks' = lo_workbooks.
+  CALL METHOD OF lo_workbooks 'Add' = lo_workbook.
+
+  GET PROPERTY OF lo_workbook 'Worksheets' = lo_sheets.
+
+  CALL METHOD OF lo_sheets 'Item' = lo_sheet1
+    EXPORTING #1 = 1.
+  SET PROPERTY OF lo_sheet1 'Name' = 'Instruct'.
+
+  CALL METHOD OF lo_sheets 'Add' = lo_sheet2
+    EXPORTING #1 = lo_sheet1.
+  SET PROPERTY OF lo_sheet2 'Name' = 'Template'.
+
+  CALL METHOD OF lo_sheet1 'Cells' = lo_range
+    EXPORTING #1 = 1 #2 = 1.
+  SET PROPERTY OF lo_range 'Value' = 'DATA ENTRY GUIDE'.
+  GET PROPERTY OF lo_range 'Font' = lo_font.
+  SET PROPERTY OF lo_font 'Bold' = 1.
+  SET PROPERTY OF lo_font 'Size' = 14.
+  FREE OBJECT lo_font.
+  FREE OBJECT lo_range.
+
+  DATA: lt_guidance TYPE TABLE OF string.
+  APPEND '1. Yellow fields are primary keys (required)' TO lt_guidance.
+  APPEND '2. Date format: YYYYMMDD and Time format is: HHMMSS' TO lt_guidance.
+  APPEND '3. Number field: enter the value index' TO lt_guidance.
+  APPEND '4. Do not leave the primary key field blank' TO lt_guidance.
+  APPEND '5. Save file after entering data' TO lt_guidance.
+
+  DATA(lv_row) = 3.
+  LOOP AT lt_guidance INTO DATA(lv_text).
+    CALL METHOD OF lo_sheet1 'Cells' = lo_range
+      EXPORTING #1 = lv_row #2 = 1.
+    SET PROPERTY OF lo_range 'Value' = lv_text.
+    FREE OBJECT lo_range.
+    lv_row = lv_row + 1.
+  ENDLOOP.
+
+  CALL METHOD OF lo_sheet1 'Columns' = lo_range
+    EXPORTING #1 = 1.
+  SET PROPERTY OF lo_range 'ColumnWidth' = 60.
+  FREE OBJECT lo_range.
+
+  lv_index = 1.
+  LOOP AT lt_fields INTO ls_field.
+    DATA(lv_label) = COND #( WHEN ls_field-scrtext_l IS NOT INITIAL THEN ls_field-scrtext_l
+                             WHEN ls_field-scrtext_m IS NOT INITIAL THEN ls_field-scrtext_m
+                             WHEN ls_field-scrtext_s IS NOT INITIAL THEN ls_field-scrtext_s
+                             ELSE ls_field-fieldname ).
+
+    CALL METHOD OF lo_sheet2 'Cells' = lo_range
+      EXPORTING #1 = 1 #2 = lv_index.
+    SET PROPERTY OF lo_range 'Value' = lv_label.
+
+    GET PROPERTY OF lo_range 'Font' = lo_font.
+    SET PROPERTY OF lo_font 'Bold' = 1.
+    FREE OBJECT lo_font.
+
+    READ TABLE lt_dd03l WITH KEY tabname = p_table fieldname = ls_field-fieldname TRANSPORTING NO FIELDS.
+    IF sy-subrc = 0.
+      GET PROPERTY OF lo_range 'Interior' = lo_interior.
+      SET PROPERTY OF lo_interior 'Color' = 10092543.
+      FREE OBJECT lo_interior.
+    ENDIF.
+
+    CALL METHOD OF lo_sheet2 'Columns' = lo_range
+      EXPORTING #1 = lv_index.
+    SET PROPERTY OF lo_range 'AutoFit' = 1.
+    FREE OBJECT lo_range.
+
+    lv_index = lv_index + 1.
+  ENDLOOP.
+
+  CALL METHOD OF lo_workbook 'SaveAs'
+    EXPORTING
+      #1 = lv_fullpath
+      #2 = 51.
+
+  CALL METHOD OF lo_workbook 'Close' EXPORTING #1 = 0.
+  CALL METHOD OF lo_excel 'Quit'.
+
+  FREE OBJECT: lo_sheet1, lo_sheet2, lo_sheets, lo_workbook, lo_workbooks, lo_excel.
+
+  MESSAGE s064(zsap03_msg_cl) WITH lv_fullpath.
+
+  cl_gui_frontend_services=>execute(
+    EXPORTING
+      document = lv_fullpath
+    EXCEPTIONS
+      OTHERS   = 1
+  ).
+ENDFORM.
+
+*FORM upload_data_from_excel.
+*  DATA: lt_file_table  TYPE filetable,
+*        lv_rc          TYPE i,
+*        lv_file_path   TYPE string,
+*        lt_excel_data  TYPE STANDARD TABLE OF alsmex_tabline,
+*        ls_excel_line  TYPE alsmex_tabline,
+*        lt_key_fields  TYPE TABLE OF dd03l,
+*        lv_row         TYPE i VALUE 1,
+*        lv_error_count TYPE i VALUE 0,
+*        lv_msg         TYPE string.
+*
+*  TYPES: BEGIN OF ty_field_mapping,
+*           excel_name TYPE string,
+*           ddic_name  TYPE fieldname,
+*           col_pos    TYPE i,
+*           datatype   TYPE datatype_d,
+*         END OF ty_field_mapping.
+*
+*  FIELD-SYMBOLS: <lt_alv>      TYPE STANDARD TABLE,
+*                 <ls_alv>      TYPE any,
+*                 <ls_existing> TYPE any,
+*                 <lv_field>    TYPE any,
+*                 <lv_is_new>   TYPE any,
+*                 <lt_celltab>  TYPE lvc_t_styl.
+*
+*  CALL METHOD cl_gui_frontend_services=>file_open_dialog
+*    EXPORTING
+*      window_title            = 'Select Excel File'
+*      file_filter             = 'Excel Files (*.XLSX)|*.XLSX|'
+*    CHANGING
+*      file_table              = lt_file_table
+*      rc                      = lv_rc
+*    EXCEPTIONS
+*      file_open_dialog_failed = 1
+*      cntl_error              = 2
+*      error_no_gui            = 3
+*      not_supported_by_gui    = 4
+*      OTHERS                  = 5.
+*
+*  IF sy-subrc <> 0 OR lv_rc = 0 OR lt_file_table IS INITIAL.
+*    MESSAGE s065(zsap03_msg_cl).
+*    RETURN.
+*  ENDIF.
+*
+*  READ TABLE lt_file_table INDEX 1 INTO DATA(ls_file).
+*  IF sy-subrc <> 0.
+*    MESSAGE e066(zsap03_msg_cl).
+*    RETURN.
+*  ENDIF.
+*
+*  lv_file_path = ls_file-filename.
+*
+*  DATA: lv_filename TYPE rlgrap-filename.
+*  lv_filename = lv_file_path.
+*
+*  CALL FUNCTION 'ALSM_EXCEL_TO_INTERNAL_TABLE'
+*    EXPORTING
+*      filename                = lv_filename
+*      i_begin_col             = 1
+*      i_begin_row             = 1
+*      i_end_col               = 100
+*      i_end_row               = 1
+*    TABLES
+*      intern                  = lt_excel_data
+*    EXCEPTIONS
+*      inconsistent_parameters = 1
+*      upload_ole              = 2
+*      OTHERS                  = 3.
+*
+*  IF sy-subrc <> 0 OR lt_excel_data IS INITIAL.
+*    MESSAGE e067(zsap03_msg_cl).
+*    RETURN.
+*  ENDIF.
+*
+*  DATA: lt_expected_fields TYPE TABLE OF dfies,
+*        lt_actual_headers  TYPE STANDARD TABLE OF string,
+*        ls_header_line     TYPE alsmex_tabline.
+*
+*  CALL FUNCTION 'DDIF_FIELDINFO_GET'
+*    EXPORTING
+*      tabname        = p_table
+*    TABLES
+*      dfies_tab      = lt_expected_fields
+*    EXCEPTIONS
+*      not_found      = 1
+*      internal_error = 2
+*      OTHERS         = 3.
+*
+*  IF sy-subrc <> 0.
+*    MESSAGE e068(zsap03_msg_cl).
+*    RETURN.
+*  ENDIF.
+*
+*  DATA:
+*    lv_error_msg       TYPE string,
+*    lv_header_mismatch TYPE abap_bool VALUE abap_false.
+*
+*  CLEAR lt_actual_headers.
+*  LOOP AT lt_excel_data INTO ls_header_line WHERE row = 1.
+*    IF ls_header_line-value IS INITIAL.
+*      lv_error_msg = 'Empty header found in column ' && ls_header_line-col && '. All headers must have a value.'.
+*      lv_header_mismatch = abap_true.
+*      EXIT.
+*    ENDIF.
+*    APPEND ls_header_line-value TO lt_actual_headers.
+*  ENDLOOP.
+*
+*  IF lv_header_mismatch = abap_true.
+*    MESSAGE i069(zsap03_msg_cl) WITH ls_header_line-col.
+*    RETURN.
+*  ENDIF.
+*
+*  DATA(lv_actual_count)   = lines( lt_actual_headers ).
+*  DATA(lv_expected_count) = lines( lt_expected_fields ).
+*
+*  IF lv_actual_count <> lv_expected_count.
+*    MESSAGE i070(zsap03_msg_cl)
+*      WITH lv_actual_count lv_expected_count.
+*    RETURN.
+*  ENDIF.
+*
+*  LOOP AT lt_expected_fields INTO DATA(ls_expected_field).
+*    DATA(lv_index) = sy-tabix.
+*
+*    READ TABLE lt_actual_headers INTO DATA(lv_header) INDEX lv_index.
+*    IF sy-subrc <> 0.
+*      MESSAGE i071(zsap03_msg_cl) WITH lv_index.
+*      RETURN.
+*    ENDIF.
+*
+*    "Get the expected label text
+*    DATA(lv_expected_label) = COND #( WHEN ls_expected_field-scrtext_l IS NOT INITIAL THEN ls_expected_field-scrtext_l
+*                                     WHEN ls_expected_field-scrtext_m IS NOT INITIAL THEN ls_expected_field-scrtext_m
+*                                     WHEN ls_expected_field-scrtext_s IS NOT INITIAL THEN ls_expected_field-scrtext_s
+*                                     ELSE ls_expected_field-fieldname ).
+*
+*    "Check if header matches either fieldname or any of the label texts
+*    IF to_upper( lv_header ) <> to_upper( ls_expected_field-fieldname ) AND
+*       to_upper( lv_header ) <> to_upper( lv_expected_label ).
+*      MESSAGE i072(zsap03_msg_cl) WITH lv_index lv_header ls_expected_field-fieldname lv_expected_label.
+*      RETURN.
+*    ENDIF.
+*  ENDLOOP.
+*
+*  CLEAR lt_excel_data.
+*  CALL FUNCTION 'ALSM_EXCEL_TO_INTERNAL_TABLE'
+*    EXPORTING
+*      filename                = lv_filename
+*      i_begin_col             = 1
+*      i_begin_row             = 2
+*      i_end_col               = 100
+*      i_end_row               = 9999
+*    TABLES
+*      intern                  = lt_excel_data
+*    EXCEPTIONS
+*      inconsistent_parameters = 1
+*      upload_ole              = 2
+*      OTHERS                  = 3.
+*
+*  IF sy-subrc <> 0 OR lt_excel_data IS INITIAL.
+*    MESSAGE i073(zsap03_msg_cl).
+*    RETURN.
+*  ENDIF.
+*
+*  SELECT * FROM dd03l INTO TABLE lt_key_fields
+*    WHERE tabname = p_table
+*      AND keyflag = 'X'
+*      AND as4local = 'A'
+*      AND as4vers = '0000'
+*    ORDER BY position.
+*
+*  DATA: lt_field_types TYPE TABLE OF dfies.
+*  CALL FUNCTION 'DDIF_FIELDINFO_GET'
+*    EXPORTING
+*      tabname        = p_table
+*    TABLES
+*      dfies_tab      = lt_field_types
+*    EXCEPTIONS
+*      not_found      = 1
+*      internal_error = 2
+*      OTHERS         = 3.
+*
+*  ASSIGN gt_alv_data->* TO <lt_alv>.
+*  IF <lt_alv> IS NOT ASSIGNED.
+*    MESSAGE i074(zsap03_msg_cl).
+*    RETURN.
+*  ENDIF.
+*
+*  DATA: lv_current_row TYPE i VALUE 0,
+*        lt_errors      TYPE TABLE OF string,
+*        lv_has_errors  TYPE abap_bool VALUE abap_false.
+*
+*  DATA(lo_date_time_checker) = NEW zcl_check_valid_date_time( ).
+*
+*  LOOP AT lt_excel_data INTO ls_excel_line.
+*    IF ls_excel_line-row <> lv_current_row.
+*      lv_current_row = ls_excel_line-row.
+*      lv_row = lv_row + 1.
+*
+*      APPEND INITIAL LINE TO <lt_alv> ASSIGNING <ls_alv>.
+*
+*      ASSIGN COMPONENT 'IS_NEW' OF STRUCTURE <ls_alv> TO <lv_is_new>.
+*      IF sy-subrc = 0.
+*        <lv_is_new> = abap_true.
+*      ENDIF.
+*
+*      ASSIGN COMPONENT 'CELLTAB' OF STRUCTURE <ls_alv> TO <lt_celltab>.
+*      IF sy-subrc = 0.
+*        CLEAR <lt_celltab>.
+*      ENDIF.
+*
+*      IF <ls_alv> IS ASSIGNED.
+*        ASSIGN COMPONENT 'HAS_ERROR' OF STRUCTURE <ls_alv> TO FIELD-SYMBOL(<lv_has_error>).
+*        IF sy-subrc = 0.
+*          <lv_has_error> = abap_false.
+*        ENDIF.
+*      ENDIF.
+*    ENDIF.
+*
+*    READ TABLE lt_field_types INTO DATA(ls_field_info) INDEX ls_excel_line-col.
+*    IF sy-subrc <> 0.
+*      CONTINUE.
+*    ENDIF.
+*
+*    IF <ls_alv> IS ASSIGNED.
+*      ASSIGN COMPONENT ls_excel_line-col OF STRUCTURE <ls_alv> TO <lv_field>.
+*      IF sy-subrc <> 0.
+*        CONTINUE.
+*      ENDIF.
+*
+*      DESCRIBE FIELD <lv_field> TYPE DATA(lv_type).
+*      CASE lv_type.
+*        WHEN 'D'.
+*          DATA(lv_date) = CONV d( ls_excel_line-value ).
+*          DATA(lv_dummy_time) = CONV t( '000000' ).
+*          CONVERT DATE lv_date TIME lv_dummy_time
+*            INTO TIME STAMP DATA(lv_timestamp)
+*            TIME ZONE 'UTC'.
+*
+*          IF sy-subrc <> 0.
+*            MESSAGE e075(zsap03_msg_cl) WITH ls_excel_line-row ls_excel_line-value INTO lv_msg.
+*            APPEND lv_msg TO lt_errors.
+*            IF <ls_alv> IS ASSIGNED AND <lv_has_error> IS ASSIGNED.
+*              <lv_has_error> = abap_true.
+*            ENDIF.
+*            lv_has_errors = abap_true.
+*            CONTINUE.
+*          ENDIF.
+*          <lv_field> = lv_date.
+*
+*        WHEN 'T'.
+*          DATA(lv_time) = CONV t( ls_excel_line-value ).
+*          DATA(lv_dummy_date) = CONV d( '19700101' ).
+*          CONVERT DATE lv_dummy_date TIME lv_time
+*            INTO TIME STAMP lv_timestamp
+*            TIME ZONE 'UTC'.
+*
+*          IF sy-subrc <> 0.
+*            MESSAGE e076(zsap03_msg_cl) WITH ls_excel_line-row ls_excel_line-value INTO lv_msg.
+*            APPEND lv_msg TO lt_errors.
+*            IF <ls_alv> IS ASSIGNED AND <lv_has_error> IS ASSIGNED.
+*              <lv_has_error> = abap_true.
+*            ENDIF.
+*            lv_has_errors = abap_true.
+*            CONTINUE.
+*          ENDIF.
+*          <lv_field> = lv_time.
+*
+*        WHEN 'I' OR 'P' OR 'F'.
+*          TRY.
+*              <lv_field> = ls_excel_line-value.
+*            CATCH cx_sy_conversion_no_number INTO DATA(lx_conv_error).
+*              MESSAGE e079(zsap03_msg_cl) WITH ls_excel_line-row lx_conv_error->get_text( ) INTO lv_msg.
+*              APPEND lv_msg TO lt_errors.
+*              IF <ls_alv> IS ASSIGNED AND <lv_has_error> IS ASSIGNED.
+*                <lv_has_error> = abap_true.
+*              ENDIF.
+*              lv_has_errors = abap_true.
+*              CONTINUE.
+*          ENDTRY.
+*
+*        WHEN 'INT1' OR 'INT2' OR 'INT4' OR 'DEC' OR 'CURR' OR 'QUAN'.
+*          IF ls_excel_line-value IS NOT INITIAL.
+*            TRY.
+*                <lv_field> = ls_excel_line-value.
+*              CATCH cx_sy_conversion_no_number.
+*                MESSAGE e077(zsap03_msg_cl) WITH ls_excel_line-row lx_conv_error->get_text( ) INTO lv_msg.
+*                APPEND lv_msg TO lt_errors.
+*                <lv_has_error> = abap_true.
+*                lv_has_errors = abap_true.
+*            ENDTRY.
+*          ENDIF.
+*
+*        WHEN OTHERS.
+*          " Then check domain values if needed
+*          IF ls_field_info-domname IS NOT INITIAL.
+*            IF lcl_value_checker=>check_domain_value(
+*                 iv_domain = ls_field_info-domname
+*                 iv_value  = ls_excel_line-value ) = abap_false.
+*              MESSAGE e078(zsap03_msg_cl)
+*                WITH ls_excel_line-row ls_excel_line-value ls_field_info-domname
+*                INTO lv_msg.
+*              APPEND lv_msg TO lt_errors.
+*              IF <ls_alv> IS ASSIGNED AND <lv_has_error> IS ASSIGNED.
+*                <lv_has_error> = abap_true.
+*              ENDIF.
+*              lv_has_errors = abap_true.
+*              CONTINUE.
+*            ENDIF.
+*          ENDIF.
+*          <lv_field> = ls_excel_line-value.
+*      ENDCASE.
+*    ENDIF.
+*  ENDLOOP.
+*
+*  IF lv_has_errors = abap_true.
+*    lv_error_count = lines( lt_errors ).
+*    MESSAGE i080(zsap03_msg_cl) WITH lv_error_count.
+*    LOOP AT lt_errors INTO DATA(lv_error).
+*      MESSAGE i011(zsap03_msg_cl) WITH lv_error.
+*    ENDLOOP.
+*  ELSE.
+*    MESSAGE s081(zsap03_msg_cl).
+*  ENDIF.
+*
+*  PERFORM set_color.
+*
+*  DATA: lv_start_index     TYPE i,
+*        lv_end_index       TYPE i,
+*        lv_duplicate_found TYPE abap_bool VALUE abap_false,
+*        lv_key_match       TYPE abap_bool,
+*        lv_update_count    TYPE i VALUE 0,
+*        lv_insert_count    TYPE i VALUE 0.
+*
+*  lv_start_index = lines( <lt_alv> ) - lv_row + 2.
+*  lv_end_index = lines( <lt_alv> ).
+*
+*  LOOP AT <lt_alv> ASSIGNING <ls_alv> FROM lv_start_index TO lv_end_index.
+*    ASSIGN COMPONENT 'IS_NEW' OF STRUCTURE <ls_alv> TO <lv_is_new>.
+*    IF sy-subrc = 0 AND <lv_is_new> = abap_true.
+*      LOOP AT <lt_alv> ASSIGNING <ls_existing>.
+*        IF sy-tabix BETWEEN lv_start_index AND lv_end_index.
+*          CONTINUE.
+*        ENDIF.
+*
+*        ASSIGN COMPONENT 'IS_DELETED' OF STRUCTURE <ls_existing> TO FIELD-SYMBOL(<lv_existing_deleted>).
+*        IF sy-subrc = 0 AND <lv_existing_deleted> <> 'X'.
+*          lv_key_match = abap_true.
+*
+*          LOOP AT lt_key_fields INTO DATA(ls_key_field_new).
+*            ASSIGN COMPONENT ls_key_field_new-fieldname OF STRUCTURE <ls_alv> TO <lv_field>.
+*            ASSIGN COMPONENT ls_key_field_new-fieldname OF STRUCTURE <ls_existing> TO FIELD-SYMBOL(<lv_existing_field>).
+*
+*            IF <lv_field> <> <lv_existing_field>.
+*              lv_key_match = abap_false.
+*              EXIT.
+*            ENDIF.
+*          ENDLOOP.
+*
+*          IF lv_key_match = abap_true.
+*            LOOP AT lt_field_types INTO DATA(ls_field_type) WHERE keyflag <> 'X'.
+*              ASSIGN COMPONENT ls_field_type-fieldname OF STRUCTURE <ls_alv> TO <lv_field>.
+*              IF sy-subrc = 0.
+*                ASSIGN COMPONENT ls_field_type-fieldname OF STRUCTURE <ls_existing> TO FIELD-SYMBOL(<lv_existing_value>).
+*                IF sy-subrc = 0.
+*                  <lv_existing_value> = COND #( WHEN <lv_field> IS INITIAL THEN '' ELSE <lv_field> ).
+*                ENDIF.
+*              ENDIF.
+*            ENDLOOP.
+*
+*            ASSIGN COMPONENT 'IS_DELETED' OF STRUCTURE <ls_alv> TO <lv_field>.
+*            IF sy-subrc = 0.
+*              <lv_field> = 'X'.
+*            ENDIF.
+*
+*            lv_duplicate_found = abap_true.
+*            lv_update_count = lv_update_count + 1.
+*            EXIT.
+*          ENDIF.
+*        ENDIF.
+*      ENDLOOP.
+*
+*      IF lv_key_match = abap_false.
+*        lv_insert_count = lv_insert_count + 1.
+*      ENDIF.
+*    ENDIF.
+*  ENDLOOP.
+*
+*  LOOP AT <lt_alv> ASSIGNING <ls_alv>.
+*    ASSIGN COMPONENT 'IS_DELETED' OF STRUCTURE <ls_alv> TO <lv_field>.
+*    IF sy-subrc = 0 AND <lv_field> = 'X'.
+*      DELETE <lt_alv> INDEX sy-tabix.
+*    ENDIF.
+*  ENDLOOP.
+*
+*  DATA(lv_total_processed) = lv_row - 1.
+*
+*  IF lv_duplicate_found = abap_true.
+*    MESSAGE s082(zsap03_msg_cl) WITH lv_total_processed lv_update_count lv_insert_count.
+*  ELSE.
+*    MESSAGE s083(zsap03_msg_cl) WITH lv_insert_count.
+*  ENDIF.
+*
+*  gv_data_changed = abap_true.
+*
+*  IF go_grid IS BOUND.
+*    CALL METHOD go_grid->refresh_table_display
+*      EXPORTING
+*        is_stable = VALUE #( row = abap_true col = abap_true ).
+*  ENDIF.
+*ENDFORM.
+
+FORM upload_data_from_excel.
+  DATA: lt_file_table  TYPE filetable,
+        lv_rc          TYPE i,
+        lv_file_path   TYPE string,
+        lt_excel_data  TYPE STANDARD TABLE OF alsmex_tabline,
+        ls_excel_line  TYPE alsmex_tabline,
+        lt_key_fields  TYPE TABLE OF dd03l,
+        lv_row         TYPE i VALUE 1,
+        lv_error_count TYPE i VALUE 0,
+        lv_msg         TYPE string.
+
+  TYPES: BEGIN OF ty_field_mapping,
+           excel_name TYPE string,
+           ddic_name  TYPE fieldname,
+           col_pos    TYPE i,
+           datatype   TYPE datatype_d,
+           reftable   TYPE tabname,
+           reffield   TYPE fieldname,
+         END OF ty_field_mapping.
+
+  FIELD-SYMBOLS: <lt_alv>      TYPE STANDARD TABLE,
+                 <ls_alv>      TYPE any,
+                 <ls_existing> TYPE any,
+                 <lv_field>    TYPE any,
+                 <lv_is_new>   TYPE any,
+                 <lt_celltab>  TYPE lvc_t_styl.
+
+  " 1. File selection dialog
+  CALL METHOD cl_gui_frontend_services=>file_open_dialog
+    EXPORTING
+      window_title            = 'Select Excel File'
+      file_filter             = 'Excel Files (*.XLSX)|*.XLSX|'
+    CHANGING
+      file_table              = lt_file_table
+      rc                      = lv_rc
+    EXCEPTIONS
+      file_open_dialog_failed = 1
+      cntl_error              = 2
+      error_no_gui            = 3
+      not_supported_by_gui    = 4
+      OTHERS                  = 5.
+
+  IF sy-subrc <> 0 OR lv_rc = 0 OR lt_file_table IS INITIAL.
+    MESSAGE s065(zsap03_msg_cl).
+    RETURN.
+  ENDIF.
+
+  READ TABLE lt_file_table INDEX 1 INTO DATA(ls_file).
+  IF sy-subrc <> 0.
+    MESSAGE e066(zsap03_msg_cl).
+    RETURN.
+  ENDIF.
+
+  lv_file_path = ls_file-filename.
+
+  " 2. Read Excel file (header row)
+  DATA: lv_filename TYPE rlgrap-filename.
+  lv_filename = lv_file_path.
+
+  CALL FUNCTION 'ALSM_EXCEL_TO_INTERNAL_TABLE'
+    EXPORTING
+      filename                = lv_filename
+      i_begin_col             = 1
+      i_begin_row             = 1
+      i_end_col               = 100
+      i_end_row               = 1
+    TABLES
+      intern                  = lt_excel_data
+    EXCEPTIONS
+      inconsistent_parameters = 1
+      upload_ole              = 2
+      OTHERS                  = 3.
+
+  IF sy-subrc <> 0 OR lt_excel_data IS INITIAL.
+    MESSAGE e067(zsap03_msg_cl).
+    RETURN.
+  ENDIF.
+
+  " 3. Get field metadata for target table
+  DATA: lt_expected_fields TYPE TABLE OF dfies,
+        lt_dd08l           TYPE TABLE OF dd08l,
+        lt_actual_headers  TYPE STANDARD TABLE OF string,
+        ls_header_line     TYPE alsmex_tabline.
+
+  CALL FUNCTION 'DDIF_FIELDINFO_GET'
+    EXPORTING
+      tabname        = p_table
+    TABLES
+      dfies_tab      = lt_expected_fields
+    EXCEPTIONS
+      not_found      = 1
+      internal_error = 2
+      OTHERS         = 3.
+
+  IF sy-subrc <> 0.
+    MESSAGE e068(zsap03_msg_cl).
+    RETURN.
+  ENDIF.
+
+  " Get Check Table info from DD08L
+  SELECT * FROM dd08l INTO TABLE lt_dd08l WHERE tabname = p_table.
+
+  LOOP AT lt_expected_fields ASSIGNING FIELD-SYMBOL(<fs_field>).
+    READ TABLE lt_dd08l INTO DATA(ls_dd08l) WITH KEY fieldname = <fs_field>-fieldname.
+    IF sy-subrc = 0.
+      <fs_field>-reftable  = ls_dd08l-checktable.
+      <fs_field>-reffield  = ls_dd08l-fieldname.
+    ENDIF.
+  ENDLOOP.
+
+  " 4. Validate header row
+  DATA: lv_error_msg       TYPE string,
+        lv_header_mismatch TYPE abap_bool VALUE abap_false.
+
+  CLEAR lt_actual_headers.
+  LOOP AT lt_excel_data INTO ls_header_line WHERE row = 1.
+    IF ls_header_line-value IS INITIAL.
+      lv_error_msg = 'Empty header found in column ' && ls_header_line-col && '. All headers must have a value.'.
+      lv_header_mismatch = abap_true.
+      EXIT.
+    ENDIF.
+    APPEND ls_header_line-value TO lt_actual_headers.
+  ENDLOOP.
+
+  IF lv_header_mismatch = abap_true.
+    MESSAGE i069(zsap03_msg_cl) WITH ls_header_line-col.
+    RETURN.
+  ENDIF.
+
+  DATA(lv_actual_count)   = lines( lt_actual_headers ).
+  DATA(lv_expected_count) = lines( lt_expected_fields ).
+
+  IF lv_actual_count <> lv_expected_count.
+    MESSAGE i070(zsap03_msg_cl) WITH lv_actual_count lv_expected_count.
+    RETURN.
+  ENDIF.
+
+  " 5. Verify header names match expected fields
+  LOOP AT lt_expected_fields INTO DATA(ls_expected_field).
+    DATA(lv_index) = sy-tabix.
+
+    READ TABLE lt_actual_headers INTO DATA(lv_header) INDEX lv_index.
+    IF sy-subrc <> 0.
+      MESSAGE i071(zsap03_msg_cl) WITH lv_index.
+      RETURN.
+    ENDIF.
+
+    " Get the expected label text
+    DATA(lv_expected_label) = COND #(
+      WHEN ls_expected_field-scrtext_l IS NOT INITIAL THEN ls_expected_field-scrtext_l
+      WHEN ls_expected_field-scrtext_m IS NOT INITIAL THEN ls_expected_field-scrtext_m
+      WHEN ls_expected_field-scrtext_s IS NOT INITIAL THEN ls_expected_field-scrtext_s
+      ELSE ls_expected_field-fieldname ).
+
+    " Check if header matches either fieldname or any of the label texts
+    IF to_upper( lv_header ) <> to_upper( ls_expected_field-fieldname ) AND
+       to_upper( lv_header ) <> to_upper( lv_expected_label ).
+      MESSAGE i072(zsap03_msg_cl) WITH lv_index lv_header ls_expected_field-fieldname lv_expected_label.
+      RETURN.
+    ENDIF.
+  ENDLOOP.
+
+  " 6. Read Excel data (actual rows)
+  CLEAR lt_excel_data.
+  CALL FUNCTION 'ALSM_EXCEL_TO_INTERNAL_TABLE'
+    EXPORTING
+      filename                = lv_filename
+      i_begin_col             = 1
+      i_begin_row             = 2
+      i_end_col               = 100
+      i_end_row               = 9999
+    TABLES
+      intern                  = lt_excel_data
+    EXCEPTIONS
+      inconsistent_parameters = 1
+      upload_ole              = 2
+      OTHERS                  = 3.
+
+  IF sy-subrc <> 0 OR lt_excel_data IS INITIAL.
+    MESSAGE i073(zsap03_msg_cl).
+    RETURN.
+  ENDIF.
+
+  " 7. Get key fields for duplicate checking
+  SELECT * FROM dd03l INTO TABLE lt_key_fields
+    WHERE tabname = p_table
+      AND keyflag = 'X'
+      AND as4local = 'A'
+      AND as4vers = '0000'
+    ORDER BY position.
+
+  " 8. Get complete field metadata for validation
+  DATA: lt_field_types TYPE TABLE OF dfies.
+  CALL FUNCTION 'DDIF_FIELDINFO_GET'
+    EXPORTING
+      tabname        = p_table
+    TABLES
+      dfies_tab      = lt_field_types
+    EXCEPTIONS
+      not_found      = 1
+      internal_error = 2
+      OTHERS         = 3.
+
+  " 9. Assign ALV data table
+  ASSIGN gt_alv_data->* TO <lt_alv>.
+  IF <lt_alv> IS NOT ASSIGNED.
+    MESSAGE i074(zsap03_msg_cl).
+    RETURN.
+  ENDIF.
+
+  " 10. Process Excel data rows
+  DATA: lv_current_row TYPE i VALUE 0,
+        lt_errors      TYPE TABLE OF string,
+        lv_has_errors  TYPE abap_bool VALUE abap_false.
+
+  DATA(lo_date_time_checker) = NEW zcl_check_valid_date_time( ).
+
+  LOOP AT lt_excel_data INTO ls_excel_line.
+    IF ls_excel_line-row <> lv_current_row.
+      " New row - initialize record
+      lv_current_row = ls_excel_line-row.
+      lv_row = lv_row + 1.
+
+      APPEND INITIAL LINE TO <lt_alv> ASSIGNING <ls_alv>.
+
+      ASSIGN COMPONENT 'IS_NEW' OF STRUCTURE <ls_alv> TO <lv_is_new>.
+      IF sy-subrc = 0.
+        <lv_is_new> = abap_true.
+      ENDIF.
+
+      ASSIGN COMPONENT 'CELLTAB' OF STRUCTURE <ls_alv> TO <lt_celltab>.
+      IF sy-subrc = 0.
+        CLEAR <lt_celltab>.
+      ENDIF.
+
+      IF <ls_alv> IS ASSIGNED.
+        ASSIGN COMPONENT 'HAS_ERROR' OF STRUCTURE <ls_alv> TO FIELD-SYMBOL(<lv_has_error>).
+        IF sy-subrc = 0.
+          <lv_has_error> = abap_false.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+    " Get field metadata for current column
+    READ TABLE lt_field_types INTO DATA(ls_field_info) WITH KEY position = ls_excel_line-col.
+    IF sy-subrc <> 0.
+      CONTINUE.
+    ENDIF.
+
+    IF <ls_alv> IS ASSIGNED.
+      ASSIGN COMPONENT ls_field_info-fieldname OF STRUCTURE <ls_alv> TO <lv_field>.
+      IF sy-subrc <> 0.
+        CONTINUE.
+      ENDIF.
+
+      " Field type validation
+      DESCRIBE FIELD <lv_field> TYPE DATA(lv_type).
+      CASE lv_type.
+        WHEN 'D'. " Date
+          DATA(lv_date) = CONV d( ls_excel_line-value ).
+          DATA(lv_dummy_time) = CONV t( '000000' ).
+          CONVERT DATE lv_date TIME lv_dummy_time
+            INTO TIME STAMP DATA(lv_timestamp)
+            TIME ZONE 'UTC'.
+
+          IF sy-subrc <> 0.
+            MESSAGE e075(zsap03_msg_cl) WITH ls_excel_line-row ls_excel_line-value INTO lv_msg.
+            APPEND lv_msg TO lt_errors.
+            IF <lv_has_error> IS ASSIGNED.
+              <lv_has_error> = abap_true.
+            ENDIF.
+            lv_has_errors = abap_true.
+            CONTINUE.
+          ENDIF.
+          <lv_field> = lv_date.
+
+        WHEN 'T'. " Time
+          DATA(lv_time) = CONV t( ls_excel_line-value ).
+          DATA(lv_dummy_date) = CONV d( '19700101' ).
+          CONVERT DATE lv_dummy_date TIME lv_time
+            INTO TIME STAMP lv_timestamp
+            TIME ZONE 'UTC'.
+
+          IF sy-subrc <> 0.
+            MESSAGE e076(zsap03_msg_cl) WITH ls_excel_line-row ls_excel_line-value INTO lv_msg.
+            APPEND lv_msg TO lt_errors.
+            IF <lv_has_error> IS ASSIGNED.
+              <lv_has_error> = abap_true.
+            ENDIF.
+            lv_has_errors = abap_true.
+            CONTINUE.
+          ENDIF.
+          <lv_field> = lv_time.
+
+        WHEN 'I' OR 'P' OR 'F'. " Integer, packed, float
+          TRY.
+              <lv_field> = ls_excel_line-value.
+            CATCH cx_sy_conversion_no_number INTO DATA(lx_conv_error).
+              MESSAGE e079(zsap03_msg_cl) WITH ls_excel_line-row lx_conv_error->get_text( ) INTO lv_msg.
+              APPEND lv_msg TO lt_errors.
+              IF <lv_has_error> IS ASSIGNED.
+                <lv_has_error> = abap_true.
+              ENDIF.
+              lv_has_errors = abap_true.
+              CONTINUE.
+          ENDTRY.
+
+        WHEN 'INT1' OR 'INT2' OR 'INT4' OR 'DEC' OR 'CURR' OR 'QUAN'. " Other numeric types
+          IF ls_excel_line-value IS NOT INITIAL.
+            TRY.
+                <lv_field> = ls_excel_line-value.
+              CATCH cx_sy_conversion_no_number.
+                MESSAGE e077(zsap03_msg_cl) WITH ls_excel_line-row lx_conv_error->get_text( ) INTO lv_msg.
+                APPEND lv_msg TO lt_errors.
+                IF <lv_has_error> IS ASSIGNED.
+                  <lv_has_error> = abap_true.
+                ENDIF.
+                lv_has_errors = abap_true.
+                CONTINUE.
+            ENDTRY.
+          ENDIF.
+
+        WHEN OTHERS. " Character, numeric, etc.
+          " Check domain values if domain exists
+          IF ls_field_info-domname IS NOT INITIAL.
+            IF lcl_value_checker=>check_domain_value(
+                 iv_domain = ls_field_info-domname
+                 iv_value  = ls_excel_line-value ) = abap_false.
+              MESSAGE e078(zsap03_msg_cl)
+                WITH ls_excel_line-row ls_excel_line-value ls_field_info-domname
+                INTO lv_msg.
+              APPEND lv_msg TO lt_errors.
+              IF <lv_has_error> IS ASSIGNED.
+                <lv_has_error> = abap_true.
+              ENDIF.
+              lv_has_errors = abap_true.
+              CONTINUE.
+            ENDIF.
+          ENDIF.
+
+          IF ls_field_info-reftable IS NOT INITIAL
+   AND ls_field_info-reffield IS NOT INITIAL
+   AND ls_excel_line-value IS NOT INITIAL.
+
+            DATA: lv_sql_stmt TYPE string,
+                  lv_count    TYPE i.
+
+            " Escape dấu nháy đơn nếu có trong giá trị Excel
+            DATA(lv_escaped_val) = ls_excel_line-value.
+            REPLACE ALL OCCURRENCES OF '''' IN lv_escaped_val WITH ''''''.
+
+            " Build dynamic SQL string
+            CONCATENATE 'SELECT COUNT(*) INTO lv_count FROM'
+                        ls_field_info-reftable
+                        'WHERE' ls_field_info-reffield
+                        '= ''' lv_escaped_val ''''
+                        INTO lv_sql_stmt SEPARATED BY space.
+
+            " Execute SQL
+            TRY.
+                EXEC SQL.
+                  EXECUTE IMMEDIATE :lv_sql_stmt
+                ENDEXEC.
+              CATCH cx_sy_native_sql_error INTO DATA(lx_sql).
+                lv_msg = lx_sql->get_text( ).
+                APPEND lv_msg TO lt_errors.
+                CONTINUE.
+            ENDTRY.
+
+            IF lv_count = 0.
+              MESSAGE e077(zsap03_msg_cl)
+                WITH ls_excel_line-row ls_excel_line-value ls_field_info-reftable
+                INTO lv_msg.
+              APPEND lv_msg TO lt_errors.
+              IF <lv_has_error> IS ASSIGNED.
+                <lv_has_error> = abap_true.
+              ENDIF.
+              lv_has_errors = abap_true.
+              CONTINUE.
+            ENDIF.
+          ENDIF.
+          " If all validations passed, assign the value
+          <lv_field> = ls_excel_line-value.
+      ENDCASE.
+    ENDIF.
+  ENDLOOP.
+
+  " 11. Error handling
+  IF lv_has_errors = abap_true.
+    lv_error_count = lines( lt_errors ).
+    MESSAGE i080(zsap03_msg_cl) WITH lv_error_count.
+    LOOP AT lt_errors INTO DATA(lv_error).
+      MESSAGE i011(zsap03_msg_cl) WITH lv_error.
+    ENDLOOP.
+  ELSE.
+    MESSAGE s081(zsap03_msg_cl).
+  ENDIF.
+
+  " 12. Set cell colors
+  PERFORM set_color.
+
+  " 13. Check for duplicates and update existing records
+  DATA: lv_start_index     TYPE i,
+        lv_end_index       TYPE i,
+        lv_duplicate_found TYPE abap_bool VALUE abap_false,
+        lv_key_match       TYPE abap_bool,
+        lv_update_count    TYPE i VALUE 0,
+        lv_insert_count    TYPE i VALUE 0.
+
+  lv_start_index = lines( <lt_alv> ) - lv_row + 2.
+  lv_end_index = lines( <lt_alv> ).
+
+  LOOP AT <lt_alv> ASSIGNING <ls_alv> FROM lv_start_index TO lv_end_index.
+    ASSIGN COMPONENT 'IS_NEW' OF STRUCTURE <ls_alv> TO <lv_is_new>.
+    IF sy-subrc = 0 AND <lv_is_new> = abap_true.
+      LOOP AT <lt_alv> ASSIGNING <ls_existing>.
+        IF sy-tabix BETWEEN lv_start_index AND lv_end_index.
+          CONTINUE.
+        ENDIF.
+
+        ASSIGN COMPONENT 'IS_DELETED' OF STRUCTURE <ls_existing> TO FIELD-SYMBOL(<lv_existing_deleted>).
+        IF sy-subrc = 0 AND <lv_existing_deleted> <> 'X'.
+          lv_key_match = abap_true.
+
+          " Compare key fields
+          LOOP AT lt_key_fields INTO DATA(ls_key_field).
+            ASSIGN COMPONENT ls_key_field-fieldname OF STRUCTURE <ls_alv> TO <lv_field>.
+            ASSIGN COMPONENT ls_key_field-fieldname OF STRUCTURE <ls_existing> TO FIELD-SYMBOL(<lv_existing_field>).
+
+            IF <lv_field> <> <lv_existing_field>.
+              lv_key_match = abap_false.
+              EXIT.
+            ENDIF.
+          ENDLOOP.
+
+          " Update existing record if keys match
+          IF lv_key_match = abap_true.
+            LOOP AT lt_field_types INTO DATA(ls_field_type) WHERE keyflag <> 'X'.
+              ASSIGN COMPONENT ls_field_type-fieldname OF STRUCTURE <ls_alv> TO <lv_field>.
+              IF sy-subrc = 0.
+                ASSIGN COMPONENT ls_field_type-fieldname OF STRUCTURE <ls_existing> TO FIELD-SYMBOL(<lv_existing_value>).
+                IF sy-subrc = 0.
+                  <lv_existing_value> = COND #( WHEN <lv_field> IS INITIAL THEN '' ELSE <lv_field> ).
+                ENDIF.
+              ENDIF.
+            ENDLOOP.
+
+            " Mark new record for deletion
+            ASSIGN COMPONENT 'IS_DELETED' OF STRUCTURE <ls_alv> TO <lv_field>.
+            IF sy-subrc = 0.
+              <lv_field> = 'X'.
+            ENDIF.
+
+            lv_duplicate_found = abap_true.
+            lv_update_count = lv_update_count + 1.
+            EXIT.
+          ENDIF.
+        ENDIF.
+      ENDLOOP.
+
+      " Count inserts for non-duplicates
+      IF lv_key_match = abap_false.
+        lv_insert_count = lv_insert_count + 1.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+  " 14. Remove marked records
+  LOOP AT <lt_alv> ASSIGNING <ls_alv>.
+    ASSIGN COMPONENT 'IS_DELETED' OF STRUCTURE <ls_alv> TO <lv_field>.
+    IF sy-subrc = 0 AND <lv_field> = 'X'.
+      DELETE <lt_alv> INDEX sy-tabix.
+    ENDIF.
+  ENDLOOP.
+
+  " 15. Final status message
+  DATA(lv_total_processed) = lv_row - 1.
+
+  IF lv_duplicate_found = abap_true.
+    MESSAGE s082(zsap03_msg_cl) WITH lv_total_processed lv_update_count lv_insert_count.
+  ELSE.
+    MESSAGE s083(zsap03_msg_cl) WITH lv_insert_count.
+  ENDIF.
+
+  " 16. Refresh ALV display
+  gv_data_changed = abap_true.
+
+  IF go_grid IS BOUND.
+    CALL METHOD go_grid->refresh_table_display
+      EXPORTING
+        is_stable = VALUE #( row = abap_true col = abap_true ).
+  ENDIF.
+ENDFORM.
+
+FORM set_mail .
+  CALL FUNCTION 'VIEW_MAINTENANCE_CALL'
+    EXPORTING
+      action                       = 'S'
+      view_name                    = 'ZSAP03_EMAIL'
+    EXCEPTIONS
+      client_reference             = 1
+      foreign_lock                 = 2
+      invalid_action               = 3
+      no_clientindependent_auth    = 4
+      no_database_function         = 5
+      no_editor_function           = 6
+      no_show_auth                 = 7
+      no_tvdir_entry               = 8
+      no_upd_auth                  = 9
+      only_show_allowed            = 10
+      system_failure               = 11
+      unknown_field_in_dba_sellist = 12
+      view_not_found               = 13
+      maintenance_prohibited       = 14
+      OTHERS                       = 15.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*& Form send_email
+*&---------------------------------------------------------------------*
+*& Perform Sending Email
+*&---------------------------------------------------------------------*
+FORM send_email.
+  DATA: lt_recipients     TYPE TABLE OF zsap03_email,
+        ls_recipient      TYPE zsap03_email,
+        lo_send_request   TYPE REF TO cl_bcs,
+        lo_document       TYPE REF TO cl_document_bcs,
+        lo_sender         TYPE REF TO cl_cam_address_bcs,
+        lo_recipient      TYPE REF TO if_recipient_bcs,
+        lv_sent           TYPE os_boolean,
+        lt_body           TYPE soli_tab,
+        lv_sender_name    TYPE string,
+        lv_sender_email   TYPE ad_smtpadr,
+        lv_subject        TYPE so_obj_des,
+        ls_address        TYPE bapiaddr3,
+        lt_return         TYPE TABLE OF bapiret2,
+        lo_mime_helper    TYPE REF TO cl_gbt_multirelated_service,
+        lo_mr_api         TYPE REF TO if_mr_api,
+        lv_xstring        TYPE xstring,
+        lt_solix          TYPE solix_tab,
+        lv_obj_len        TYPE so_obj_len,
+        lv_filename       TYPE string,
+        lv_content_id     TYPE string,
+        lo_send_exception TYPE REF TO cx_root,
+        lv_reason         TYPE string.
+
+  CONSTANTS: lc_logo_filename   TYPE string VALUE 'img_logo.png',
+             lc_logo_content_id TYPE string VALUE 'img_logo.png',
+             lc_logo_url        TYPE string VALUE '/SAP/PUBLIC/logo.png'.
+
+  CALL FUNCTION 'BAPI_USER_GET_DETAIL'
+    EXPORTING
+      username = sy-uname
+    IMPORTING
+      address  = ls_address
+    TABLES
+      return   = lt_return.
+
+  lv_sender_name = ls_address-fullname.
+  lv_sender_email = ls_address-e_mail.
+
+  IF lv_sender_email IS NOT INITIAL.
+    TRY.
+        lo_sender = cl_cam_address_bcs=>create_internet_address( lv_sender_email ).
+      CATCH cx_address_bcs.
+        MESSAGE i043(zsap03_msg_cl).
+        RETURN.
+    ENDTRY.
+  ENDIF.
+
+  SELECT *
+    FROM zsap03_email
+    WHERE email_address IS NOT INITIAL
+      AND is_send = 'X'
+    INTO TABLE @lt_recipients.
+
+  IF lt_recipients IS INITIAL.
+    MESSAGE i044(zsap03_msg_cl) DISPLAY LIKE 'W'.
+    RETURN.
+  ENDIF.
+  IF lo_mr_api IS INITIAL.
+    lo_mr_api = cl_mime_repository_api=>if_mr_api~get_api( ).
+  ENDIF.
+  CLEAR lv_xstring.
+  CALL METHOD lo_mr_api->get
+    EXPORTING
+      i_url              = lc_logo_url
+    IMPORTING
+      e_content          = lv_xstring
+    EXCEPTIONS
+      parameter_missing  = 1
+      error_occured      = 2
+      not_found          = 3
+      permission_failure = 4
+      OTHERS             = 5.
+  IF sy-subrc <> 0.
+    MESSAGE w045(zsap03_msg_cl).
+    EXIT.
+  ENDIF.
+  lv_obj_len = xstrlen( lv_xstring ).
+  CLEAR lt_solix.
+  DATA: lv_offset TYPE i VALUE 0,
+        lv_length TYPE i VALUE 255,
+        lv_diff   TYPE i,
+        ls_solix  TYPE solix.
+  WHILE lv_offset < lv_obj_len.
+    lv_diff = lv_obj_len - lv_offset.
+    IF lv_diff > lv_length.
+      ls_solix-line = lv_xstring+lv_offset(lv_length).
+    ELSE.
+      ls_solix-line = lv_xstring+lv_offset(lv_diff).
+    ENDIF.
+    APPEND ls_solix TO lt_solix.
+    ADD lv_length TO lv_offset.
+  ENDWHILE.
+  LOOP AT lt_recipients INTO ls_recipient.
+    CLEAR: lt_body, lo_mime_helper, lo_document, lo_send_request, lo_recipient.
+    PERFORM build_html_body USING ls_recipient-user_name
+                                  lv_sender_name
+                           CHANGING lt_body.
+    TRY.
+        CREATE OBJECT lo_mime_helper.
+        lv_filename = lc_logo_filename.
+        lv_content_id = lc_logo_content_id.
+        CALL METHOD lo_mime_helper->add_binary_part
+          EXPORTING
+            content      = lt_solix
+            filename     = lv_filename
+            extension    = 'PNG'
+            description  = 'Company Logo'
+            content_type = 'image/png'
+            length       = lv_obj_len
+            content_id   = lv_content_id.
+        CALL METHOD lo_mime_helper->set_main_html
+          EXPORTING
+            content = lt_body.
+        lv_subject = |{ TEXT-b01 } { p_table }|.
+        lo_document = cl_document_bcs=>create_from_multirelated(
+          i_subject          = lv_subject
+          i_multirel_service = lo_mime_helper ).
+
+        IF gt_alv_snapshot IS BOUND.
+          CLEAR lv_xstring.
+          PERFORM generate_excel_xstring USING   gt_alv_snapshot
+                                                 gt_fieldcat
+                                        CHANGING lv_xstring.
+          IF lv_xstring IS NOT INITIAL.
+            CLEAR lt_solix.
+            lt_solix = cl_bcs_convert=>xstring_to_solix( lv_xstring ).
+            lv_obj_len = xstrlen( lv_xstring ).
+            lo_document->add_attachment(
+              i_attachment_type    = 'XLS'
+              i_attachment_subject = |{ TEXT-b02 }{ p_table }|
+              i_attachment_size    = lv_obj_len
+              i_att_content_hex    = lt_solix
+            ).
+          ENDIF.
+        ENDIF.
+        IF gt_alv_data IS BOUND.
+          CLEAR lv_xstring.
+          PERFORM generate_excel_xstring USING    gt_alv_data
+                                                  gt_fieldcat
+                                         CHANGING lv_xstring.
+          IF lv_xstring IS NOT INITIAL.
+            CLEAR lt_solix.
+            lt_solix = cl_bcs_convert=>xstring_to_solix( lv_xstring ).
+            lv_obj_len = xstrlen( lv_xstring ).
+            lo_document->add_attachment(
+              i_attachment_type    = 'XLS'
+              i_attachment_subject = |{ TEXT-b03 }{ p_table }|
+              i_attachment_size    = lv_obj_len
+              i_att_content_hex    = lt_solix
+            ).
+          ENDIF.
+        ENDIF.
+
+      CATCH cx_document_bcs INTO lo_send_exception.
+        lv_reason = lo_send_exception->get_text( ).
+        MESSAGE w046(zsap03_msg_cl) WITH lv_reason.
+        EXIT.
+      CATCH cx_bcom_mime INTO lo_send_exception.
+        lv_reason = lo_send_exception->get_text( ).
+        MESSAGE w046(zsap03_msg_cl) WITH lv_reason.
+        EXIT.
+      CATCH cx_gbt_mime INTO lo_send_exception.
+        lv_reason = lo_send_exception->get_text( ).
+        MESSAGE w046(zsap03_msg_cl) WITH lv_reason.
+        EXIT.
+    ENDTRY.
+    TRY.
+        lo_send_request = cl_bcs=>create_persistent( ).
+      CATCH cx_send_req_bcs INTO lo_send_exception.
+        lv_reason = lo_send_exception->get_text( ).
+        MESSAGE w046(zsap03_msg_cl) WITH lv_reason.
+        EXIT.
+    ENDTRY.
+    TRY.
+        lo_send_request->set_document( lo_document ).
+      CATCH cx_send_req_bcs INTO lo_send_exception.
+        lv_reason = lo_send_exception->get_text( ).
+        MESSAGE w046(zsap03_msg_cl) WITH lv_reason.
+        EXIT.
+    ENDTRY.
+    TRY.
+        IF lo_sender IS BOUND.
+          lo_send_request->set_sender( lo_sender ).
+        ENDIF.
+      CATCH cx_send_req_bcs INTO lo_send_exception.
+        lv_reason = lo_send_exception->get_text( ).
+        MESSAGE w046(zsap03_msg_cl) WITH lv_reason.
+        EXIT.
+    ENDTRY.
+    TRY.
+        lo_recipient = cl_cam_address_bcs=>create_internet_address( ls_recipient-email_address ).
+        lo_send_request->add_recipient( lo_recipient ).
+      CATCH cx_address_bcs INTO lo_send_exception.
+        MESSAGE e047(zsap03_msg_cl) WITH ls_recipient-email_address.
+        EXIT.
+      CATCH cx_send_req_bcs INTO lo_send_exception.
+        lv_reason = lo_send_exception->get_text( ).
+        MESSAGE i046(zsap03_msg_cl) WITH lv_reason.
+        EXIT.
+    ENDTRY.
+    TRY.
+        lv_sent = lo_send_request->send( ).
+        IF lv_sent = 'X'.
+          COMMIT WORK.
+          MESSAGE s049(zsap03_msg_cl).
+        ELSE.
+          MESSAGE e048(zsap03_msg_cl) WITH ls_recipient-email_address.
+        ENDIF.
+      CATCH cx_send_req_bcs INTO lo_send_exception.
+        lv_reason = lo_send_exception->get_text( ).
+        MESSAGE i046(zsap03_msg_cl) WITH lv_reason.
+    ENDTRY.
+  ENDLOOP.
+ENDFORM.
+FORM build_html_body USING pv_user_name   TYPE csequence
+                           pv_sender_name TYPE string
+                    CHANGING pt_body TYPE soli_tab.
+  DATA: lv_date_str      TYPE char10,
+        lv_time_str      TYPE char8,
+        lv_added_list    TYPE string,
+        lv_modified_list TYPE string,
+        lv_deleted_list  TYPE string.
+  WRITE sy-datum TO lv_date_str.
+  WRITE sy-uzeit TO lv_time_str.
+  SORT gt_added_rows ASCENDING.
+  SORT gt_modified_rows ASCENDING.
+  SORT gt_deleted_rows ASCENDING.
+  CLEAR: lv_added_list, lv_modified_list, lv_deleted_list.
+
+  IF gt_added_rows IS NOT INITIAL.
+    LOOP AT gt_added_rows INTO DATA(lv_add_index).
+      IF sy-tabix = 1.
+        lv_added_list = |{ TEXT-b04 } { lv_add_index }|.
+      ELSE.
+        lv_added_list = |{ lv_added_list }<br>{ TEXT-b04 } { lv_add_index }|.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+  IF gt_modified_rows IS NOT INITIAL.
+    LOOP AT gt_modified_rows INTO DATA(lv_mod_index).
+      IF sy-tabix = 1.
+        lv_modified_list = |{ TEXT-b04 } { lv_mod_index }|.
+      ELSE.
+        lv_modified_list = |{ lv_modified_list }<br>{ TEXT-b04 } { lv_mod_index }|.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+  IF gt_deleted_rows IS NOT INITIAL.
+    LOOP AT gt_deleted_rows INTO DATA(lv_key_string).
+      IF sy-tabix = 1.
+        lv_deleted_list = |{ TEXT-b05 } { lv_key_string }|.
+      ELSE.
+        lv_deleted_list = |{ lv_deleted_list }<br>{ TEXT-b05 } { lv_key_string }|.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+  APPEND '<!DOCTYPE html>' TO pt_body.
+  APPEND '<html>' TO pt_body.
+  APPEND '<head>' TO pt_body.
+  APPEND '<meta http-equiv="Content-Type" content="text/html; charset=utf-8">' TO pt_body.
+  APPEND '</head>' TO pt_body.
+  APPEND '<body style="font-family: ''Times New Roman'', serif; margin: 0; padding: 0; background-color: #ffffff;">' TO pt_body.
+
+  APPEND '<div style="padding: 20px; text-align: center; position: relative;">' TO pt_body.
+  APPEND |  <h2 style="color: #ff0000; text-align: center; font-weight: bold; margin: 0; font-family: ''Arial'', serif;">{ TEXT-b06 }</h2>| TO pt_body.
+  APPEND |  <div style="position: absolute; bottom: 5px; right: 20px; font-size: 14px; color: #666666; text-align: right; font-family: ''Arial'', serif;">| TO pt_body.
+  APPEND |    <p style="margin: 0;">{ lv_date_str }, { lv_time_str }</p>| TO pt_body.
+  APPEND '  </div>' TO pt_body.
+  APPEND '</div>' TO pt_body.
+
+  APPEND '<div style="margin: 40px 20px 20px 20px; font-size: 17px">' TO pt_body.
+  APPEND |  <p>{ TEXT-b07 } { pv_user_name },</p>| TO pt_body.
+  APPEND |  <p>{ TEXT-b08 } <strong style="color: #ff0000;">{ pv_sender_name }</strong> { TEXT-b09 } <strong style="color: #ff0000;">{ p_table }</strong>.</p>| TO pt_body.
+
+  APPEND '<table style="border-collapse: separate; border-spacing: 0 5px; width: 100%; box-shadow: 0 2px 5px rgba(0,0,0,0.1); border-radius: 8px; overflow: hidden;">' TO pt_body.
+  APPEND '<tr>' TO pt_body.
+  APPEND |<th style="border: 1px solid #000; padding: 10px; background-color: #f0f0f0; text-align: center;">{ TEXT-b16 }</th>| TO pt_body.
+  APPEND |<th style="border: 1px solid #000; padding: 10px; background-color: #f0f0f0; text-align: center;">{ TEXT-b17 }</th>| TO pt_body.
+  APPEND |<th style="border: 1px solid #000; padding: 10px; background-color: #f0f0f0; text-align: center; min-width: 200px;">{ TEXT-b18 }</th>| TO pt_body.
+  APPEND '</tr>' TO pt_body.
+
+  IF gt_added_rows IS NOT INITIAL.
+    APPEND '<tr>' TO pt_body.
+    APPEND |<td style="border: 1px solid #000; padding: 10px; color: #008000; text-align: center; background-color: #e6ffe6;">{ TEXT-b19 }</td>| TO pt_body.
+    APPEND |<td style="border: 1px solid #000; padding: 10px; font-weight: bold; text-align: center; background-color: #e6ffe6;">{ lines( gt_added_rows ) }</td>| TO pt_body.
+    APPEND |<td style="border: 1px solid #000; padding: 10px; word-wrap: break-word; text-align: left; background-color: #e6ffe6;">{ lv_added_list }</td>| TO pt_body.
+    APPEND '</tr>' TO pt_body.
+  ENDIF.
+
+  IF gt_modified_rows IS NOT INITIAL.
+    APPEND '<tr>' TO pt_body.
+    APPEND |<td style="border: 1px solid #000; padding: 10px; color: #FFA500; text-align: center; background-color: #fff5e6;">{ TEXT-b20 }</td>| TO pt_body.
+    APPEND |<td style="border: 1px solid #000; padding: 10px; font-weight: bold; text-align: center; background-color: #fff5e6;">{ lines( gt_modified_rows ) }</td>| TO pt_body.
+    APPEND |<td style="border: 1px solid #000; padding: 10px; word-wrap: break-word; text-align: left; background-color: #fff5e6;">{ lv_modified_list }</td>| TO pt_body.
+    APPEND '</tr>' TO pt_body.
+  ENDIF.
+
+  IF gt_deleted_rows IS NOT INITIAL.
+    APPEND '<tr>' TO pt_body.
+    APPEND |<td style="border: 1px solid #000; padding: 10px; color: #FF0000; text-align: center; background-color: #ffe6e6;">{ TEXT-b21 }</td>| TO pt_body.
+    APPEND |<td style="border: 1px solid #000; padding: 10px; font-weight: bold; text-align: center; background-color: #ffe6e6;">{ lines( gt_deleted_rows ) }</td>| TO pt_body.
+    APPEND |<td style="border: 1px solid #000; padding: 10px; word-wrap: break-word; text-align: left; background-color: #ffe6e6;">{ lv_deleted_list }</td>| TO pt_body.
+    APPEND '</tr>' TO pt_body.
+  ENDIF.
+
+  APPEND '</table>' TO pt_body.
+  APPEND '</div>' TO pt_body.
+
+  APPEND '<div style="margin-top: 30px; padding: 20px; border-top: 1px solid #eeeeee; font-style: italic; color: #666666; font-family: ''Times New Roman'', serif;">' TO pt_body.
+  APPEND |  <p style="margin: 0; font-weight: bold;">{ TEXT-b10 }</p>| TO pt_body.
+  APPEND |  <p style="margin: 0; font-weight: bold;">{ TEXT-b11 }</p>| TO pt_body.
+  APPEND '  <div style="display: flex; align-items: center; margin-top: 20px;">' TO pt_body.
+  APPEND '    <img src="cid:img_logo.png" alt="Company Logo" style="height: 100px; width: auto; margin-right: 20px;">' TO pt_body.
+  APPEND '    <div style="display: flex; align-items: center;">' TO pt_body.
+  APPEND '      <div style="width: 2px; background-color: #ff8c00; margin-right: 30px; height: 100px;"></div>' TO pt_body.
+  APPEND '      <div style="display: flex; flex-direction: column; justify-content: space-between; gap: 4px; height: 100px; color: #333333; margin-left: 15px; font-family:Arial; font-style: normal; font-size: 13px">' TO pt_body.
+  APPEND |        <p style="margin: 0; font-weight: bold; white-space: nowrap; text-align: center; color: #ff8c00; font-size: 14px;">{ TEXT-b12 }</p>| TO pt_body.
+  APPEND |        <p style="margin: 0; font-weight: bold; color: #51B848; white-space: nowrap; text-align: center;">{ TEXT-b13 }</p>| TO pt_body.
+  APPEND |        <p style="margin: 0; color: #034ea2; font-weight: bold; white-space: nowrap; text-align: center;">{ TEXT-b14 }</p>| TO pt_body.
+  APPEND |        <p style="margin: 0; color: #034ea2; white-space: nowrap; text-align: center;">{ TEXT-b15 }</p>| TO pt_body.
+  APPEND '      </div>' TO pt_body.
+  APPEND '    </div>' TO pt_body.
+  APPEND '  </div>' TO pt_body.
+  APPEND '</div>' TO pt_body.
+  APPEND '</body>' TO pt_body.
+  APPEND '</html>' TO pt_body.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form  CREATE_SPLITTER_CONTAINER
+*&---------------------------------------------------------------------*
+*& Creates a splitter container to display the backup list and preview
+*&---------------------------------------------------------------------*
+FORM create_splitter_container.
+  " Ensure the splitter is only created once
+  CHECK go_splitter IS INITIAL.
+
+  " Create a splitter container with 1 row and 2 columns on the main screen
+  CREATE OBJECT go_splitter
+    EXPORTING
+      parent  = cl_gui_container=>screen0
+      rows    = 1
+      columns = 2.
+
+  " Set the width of the first column (backup list) to 50%
+  CALL METHOD go_splitter->set_column_width
+    EXPORTING
+      id    = 1
+      width = 50.
+
+  " Get container references for the list and preview panes
+  go_cont_list = go_splitter->get_container( row = 1 column = 1 ).
+  go_cont_prev = go_splitter->get_container( row = 1 column = 2 ).
+
+  " Create ALV grid objects for both the list and preview containers
+  CREATE OBJECT go_alv_list
+    EXPORTING
+      i_parent = go_cont_list.
+
+  CREATE OBJECT go_alv_prev
+    EXPORTING
+      i_parent = go_cont_prev.
+
+  " Register the event handler for double-click on the backup list ALV
+  SET HANDLER zcl_backup_event_handler=>on_double_click FOR go_alv_list.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form  CREATE_BACKUP
+*&---------------------------------------------------------------------*
+*& Creates a backup version of the current table data.
+*&---------------------------------------------------------------------*
+FORM create_backup USING pv_reason TYPE zreason.
+  DATA: lt_data      TYPE REF TO data,
+        lv_json      TYPE string,
+        lv_xstring   TYPE xstring,
+        lv_backup_id TYPE sysuuid_c,
+        lv_version   TYPE numc4,
+        lv_row_count TYPE int4,
+        lt_parts     TYPE STANDARD TABLE OF xstring,
+        lv_length    TYPE i,
+        lv_offset    TYPE i,
+        lv_part      TYPE xstring,
+        lv_size      TYPE i VALUE 32000,
+        lv_part_no   TYPE numc4.
+
+  FIELD-SYMBOLS: <lt_table> TYPE ANY TABLE.
+
+  " Generate a unique ID for the new backup
+  TRY.
+      lv_backup_id = cl_system_uuid=>create_uuid_c32_static( ).
+    CATCH cx_uuid_error INTO DATA(lx_uuid_error).
+      MESSAGE e025(zsap03_msg_cl).
+      RETURN.
+  ENDTRY.
+
+  " Validate that the table name is provided
+  IF p_table IS INITIAL.
+    MESSAGE e026(zsap03_msg_cl).
+    RETURN.
+  ENDIF.
+
+  " Select all data from the specified table
+  CREATE DATA lt_data TYPE TABLE OF (p_table).
+  ASSIGN lt_data->* TO <lt_table>.
+  SELECT * FROM (p_table) INTO TABLE <lt_table> ORDER BY PRIMARY KEY.
+
+  " If no data exists, inform the user and exit
+  IF sy-subrc <> 0.
+    MESSAGE i027(zsap03_msg_cl).
+    RETURN.
+  ENDIF.
+
+  " Serialize the table data into a JSON string
+  TRY.
+      lv_row_count = lines( <lt_table> ).
+      lv_json = /ui2/cl_json=>serialize( data = <lt_table> compress = abap_true ).
+    CATCH cx_root INTO DATA(lx_json_error).
+      MESSAGE e028(zsap03_msg_cl).
+      RETURN.
+  ENDTRY.
+
+  " Convert the JSON string to an XSTRING for storage
+  TRY.
+      CALL FUNCTION 'SCMS_STRING_TO_XSTRING'
+        EXPORTING
+          text   = lv_json
+        IMPORTING
+          buffer = lv_xstring
+        EXCEPTIONS
+          failed = 1
+          OTHERS = 2.
+      IF sy-subrc <> 0.
+        MESSAGE e029(zsap03_msg_cl).
+        RETURN.
+      ENDIF.
+    CATCH cx_root INTO DATA(lx_conversion_error).
+      MESSAGE e029(zsap03_msg_cl).
+      RETURN.
+  ENDTRY.
+
+  " Split the XSTRING into parts if it exceeds the size limit
+  lv_length = xstrlen( lv_xstring ).
+  lv_offset = 0.
+  lv_part_no = 0.
+  CLEAR gt_backup. " Clear global table for new backup
+
+  " Loop through the XSTRING and create chunks of 32000 bytes
+  WHILE lv_offset < lv_length.
+    lv_part_no = lv_part_no + 1.
+    lv_size = lv_length - lv_offset.
+    IF lv_size > 32000.
+      lv_size = 32000.
+    ENDIF.
+    lv_part = lv_xstring+lv_offset(lv_size).
+
+    " Populate the backup structure for each part
+    CLEAR gs_backup.
+    gs_backup-mandt = sy-mandt.
+    gs_backup-backup_id = lv_backup_id.
+    gs_backup-part_no = lv_part_no.
+    gs_backup-userid = sy-uname.
+    GET TIME STAMP FIELD gs_backup-timestamp.
+    gs_backup-reason = pv_reason.
+    gs_backup-tablename = p_table.
+    gs_backup-version_nr = lv_version.
+    gs_backup-row_count = lv_row_count.
+    gs_backup-line_item = lv_part.
+    APPEND gs_backup TO gt_backup.
+    lv_offset = lv_offset + lv_size.
+  ENDWHILE.
+
+  " Determine the next version number
+  SELECT MAX( version_nr ) FROM zsap03backup_log INTO @lv_version WHERE tablename = @p_table.
+  lv_version = COND #( WHEN sy-subrc <> 0 OR lv_version IS INITIAL THEN 1 ELSE lv_version + 1 ).
+
+  " Assign the new version number to all parts of the current backup
+  LOOP AT gt_backup ASSIGNING FIELD-SYMBOL(<ls_backup>).
+    <ls_backup>-version_nr = lv_version.
+  ENDLOOP.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form  INSERT_DATA
+*&---------------------------------------------------------------------*
+*& Inserts the backup data from the global table into the database.
+*&---------------------------------------------------------------------*
+FORM insert_data.
+  " Check if there is any backup data to insert
+  IF gt_backup IS INITIAL.
+    MESSAGE e040(zsap03_msg_cl).
+    RETURN.
+  ENDIF.
+
+  " Insert all backup parts into the log table
+  INSERT zsap03backup_log FROM TABLE gt_backup.
+  IF sy-subrc = 0.
+    COMMIT WORK AND WAIT.
+    MESSAGE s031(zsap03_msg_cl).
+    CLEAR gt_backup.
+  ELSE.
+    ROLLBACK WORK.
+    MESSAGE e032(zsap03_msg_cl).
+  ENDIF.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form  DISPLAY_VERSIONS_SCREEN_200
+*&---------------------------------------------------------------------*
+*& Displays all historical backup versions in an ALV grid.
+*&---------------------------------------------------------------------*
+FORM display_versions_screen_200.
+  DATA: lv_current_id  TYPE sysuuid_c,
+        lv_xstring     TYPE xstring,
+        lv_json        TYPE string,
+        lt_data        TYPE REF TO data,
+        ls_header_info TYPE zsap03backup_log, " ADDED: To hold header data for the current group
+        lt_fieldcat    TYPE lvc_t_fcat,
+        ls_fieldcat    TYPE lvc_s_fcat,
+        lt_display     TYPE TABLE OF gty_backup_display,
+        ls_display     TYPE gty_backup_display.
+
+  FIELD-SYMBOLS: <lt_table> TYPE ANY TABLE.
+
+  " Ensure the screen container is ready
+  IF go_alv_list IS INITIAL.
+    PERFORM create_splitter_container.
+  ENDIF.
+
+  " Select all backup parts, sorted to group them by version
+  SELECT * FROM zsap03backup_log INTO TABLE @gt_backup
+    WHERE tablename = @p_table
+    ORDER BY backup_id, part_no. " IMPORTANT: Correct sorting
+
+  " Check if any backups were found
+  IF sy-subrc <> 0.
+    MESSAGE i040(zsap03_msg_cl).
+    RETURN.
+  ENDIF.
+
+  CLEAR: gt_backup_display, lv_current_id.
+
+  " Loop through each backup part to reassemble full versions
+  LOOP AT gt_backup INTO gs_backup.
+    IF gs_backup-backup_id <> lv_current_id.
+      " If a new backup_id is found, process the previously assembled version
+      IF lv_current_id IS NOT INITIAL.
+        CLEAR gs_backup_display.
+        MOVE-CORRESPONDING ls_header_info TO gs_backup_display.
+        gs_backup_display-line_item = lv_xstring.
+        gs_backup_display-tablename = ls_header_info-tablename.
+
+        " Deserialize the JSON to get an accurate row count
+        CREATE DATA lt_data TYPE TABLE OF (gs_backup_display-tablename).
+        ASSIGN lt_data->* TO <lt_table>.
+        IF <lt_table> IS ASSIGNED.
+          lv_json = cl_abap_codepage=>convert_from( source = lv_xstring ).
+          /ui2/cl_json=>deserialize( EXPORTING json = lv_json CHANGING data = <lt_table> ).
+          IF sy-subrc = 0.
+            gs_backup_display-row_count = lines( <lt_table> ).
+          ENDIF.
+        ENDIF.
+
+        " Format the timestamp for a user-friendly display
+        DATA(lv_ts_string) = |{ ls_header_info-timestamp ALIGN = LEFT PAD = '0' WIDTH = 14 }|.
+        gs_backup_display-formatted_timestamp = |{ lv_ts_string(4) }-{ lv_ts_string+4(2) }-{ lv_ts_string+6(2) } {
+                                                  lv_ts_string+8(2) }:{ lv_ts_string+10(2) }:{ lv_ts_string+12(2) }|.
+
+        APPEND gs_backup_display TO gt_backup_display.
+      ENDIF.
+
+      " Start of a new version group: store its header and first data part
+      lv_current_id = gs_backup-backup_id.
+      ls_header_info = gs_backup.
+      lv_xstring = gs_backup-line_item.
+    ELSE.
+      " Same backup ID. Concatenate the data part.
+      lv_xstring = lv_xstring && gs_backup-line_item.
+    ENDIF.
+  ENDLOOP.
+
+  " After the loop, process the very last group that was collected.
+  IF lv_current_id IS NOT INITIAL.
+    CLEAR gs_backup_display.
+    MOVE-CORRESPONDING ls_header_info TO gs_backup_display.
+    gs_backup_display-line_item = lv_xstring.
+    gs_backup_display-tablename = ls_header_info-tablename.
+
+    " Deserialize to get accurate row count
+    CREATE DATA lt_data TYPE TABLE OF (gs_backup_display-tablename).
+    ASSIGN lt_data->* TO <lt_table>.
+    IF <lt_table> IS ASSIGNED.
+      lv_json = cl_abap_codepage=>convert_from( source = lv_xstring ).
+      /ui2/cl_json=>deserialize( EXPORTING json = lv_json CHANGING data = <lt_table> ).
+      IF sy-subrc = 0.
+        gs_backup_display-row_count = lines( <lt_table> ).
+      ENDIF.
+    ENDIF.
+
+    " Format timestamp for display
+    DATA(lv_ts_string_last) = |{ ls_header_info-timestamp ALIGN = LEFT PAD = '0' WIDTH = 14 }|.
+    gs_backup_display-formatted_timestamp = |{ lv_ts_string_last(4) }-{ lv_ts_string_last+4(2) }-{ lv_ts_string_last+6(2) } {
+                                              lv_ts_string_last+8(2) }:{ lv_ts_string_last+10(2) }:{ lv_ts_string_last+12(2) }|.
+
+    APPEND gs_backup_display TO gt_backup_display.
+  ENDIF.
+
+  " Sort final display table by timestamp descending for user view
+  SORT gt_backup_display BY formatted_timestamp DESCENDING.
+
+  " Build the field catalog for the ALV display
+  CLEAR lt_fieldcat.
+  ls_fieldcat-fieldname  = 'BACKUP_ID'.
+  ls_fieldcat-scrtext_s   = TEXT-a01.
+  ls_fieldcat-scrtext_m   = TEXT-a02.
+  ls_fieldcat-scrtext_l   = TEXT-a03.
+  ls_fieldcat-coltext     = TEXT-a02.
+  ls_fieldcat-col_pos     = 1.
+  ls_fieldcat-outputlen   = 28.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname  = 'FORMATTED_TIMESTAMP'.
+  ls_fieldcat-scrtext_s   = TEXT-a15.
+  ls_fieldcat-scrtext_m   = TEXT-a15.
+  ls_fieldcat-scrtext_l   = TEXT-a16.
+  ls_fieldcat-coltext     = TEXT-a15.
+  ls_fieldcat-datatype   = 'CHAR'.
+  ls_fieldcat-col_pos     = 3.
+  ls_fieldcat-outputlen   = 19.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname  = 'USERID'.
+  ls_fieldcat-scrtext_s   = TEXT-a04.
+  ls_fieldcat-scrtext_m   = TEXT-a05.
+  ls_fieldcat-scrtext_l   = TEXT-a06.
+  ls_fieldcat-coltext     = TEXT-a05.
+  ls_fieldcat-col_pos     = 2.
+  ls_fieldcat-outputlen   = 12.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname  = 'REASON'.
+  ls_fieldcat-scrtext_s   = TEXT-a07.
+  ls_fieldcat-scrtext_m   = TEXT-a07.
+  ls_fieldcat-scrtext_l   = TEXT-a08.
+  ls_fieldcat-coltext     = TEXT-a07.
+  ls_fieldcat-col_pos     = 6.
+  ls_fieldcat-outputlen   = 25.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname  = 'VERSION_NR'.
+  ls_fieldcat-scrtext_s   = TEXT-a09.
+  ls_fieldcat-scrtext_m   = TEXT-a10.
+  ls_fieldcat-scrtext_l   = TEXT-a11.
+  ls_fieldcat-coltext     = TEXT-a09.
+  ls_fieldcat-col_pos     = 4.
+  ls_fieldcat-outputlen   = 8.
+  ls_fieldcat-just        = 'C'.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname  = 'ROW_COUNT'.
+  ls_fieldcat-scrtext_s   = TEXT-a12.
+  ls_fieldcat-scrtext_m   = TEXT-a13.
+  ls_fieldcat-scrtext_l   = TEXT-a14.
+  ls_fieldcat-coltext     = TEXT-a13.
+  ls_fieldcat-col_pos     = 5.
+  ls_fieldcat-outputlen   = 10.
+  ls_fieldcat-just        = 'C'.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname  = 'TIMESTAMP'.
+  ls_fieldcat-no_out     = 'X'.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname  = 'LINE_ITEM'.
+  ls_fieldcat-no_out     = 'X'.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname  = 'TABLENAME'.
+  ls_fieldcat-no_out     = 'X'.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  " Display the final, processed data in the ALV grid
+  CALL METHOD go_alv_list->set_table_for_first_display
+    EXPORTING
+      is_layout       = VALUE lvc_s_layo( grid_title = TEXT-a17 )
+    CHANGING
+      it_outtab       = gt_backup_display
+      it_fieldcatalog = lt_fieldcat.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form  PREVIEW_SELECTED_VERSION
+*&---------------------------------------------------------------------*
+*& Shows a preview of the data from the selected backup version.
+*&---------------------------------------------------------------------*
+FORM preview_selected_version.
+  DATA: lt_data TYPE REF TO data,
+        lv_json TYPE string,
+        lv_xstr TYPE xstring.
+  FIELD-SYMBOLS: <lt_table> TYPE ANY TABLE.
+
+  " Read the selected row from the aggregated backup display table
+  READ TABLE gt_backup_display INTO gs_backup_display WITH KEY backup_id = gv_selected_id.
+  IF sy-subrc <> 0.
+    MESSAGE e033(zsap03_msg_cl).
+    RETURN.
+  ENDIF.
+
+  " Ensure the tablename is available in our structure
+  IF gs_backup_display-tablename IS INITIAL.
+    MESSAGE e090(zsap03_msg_cl).
+    RETURN.
+  ENDIF.
+
+  " Convert the stored XSTRING back to a JSON string
+  lv_xstr = gs_backup_display-line_item.
+  lv_json = cl_abap_codepage=>convert_from( source = lv_xstr codepage = 'UTF-8' ).
+  IF lv_json IS INITIAL.
+    MESSAGE e091(zsap03_msg_cl).
+    RETURN.
+  ENDIF.
+
+  " Create a dynamic internal table with the correct structure
+  CREATE DATA lt_data TYPE TABLE OF (gs_backup_display-tablename).
+  ASSIGN lt_data->* TO <lt_table>.
+  IF <lt_table> IS NOT ASSIGNED.
+    MESSAGE e092(zsap03_msg_cl).
+    RETURN.
+  ENDIF.
+
+  " Deserialize the JSON into the dynamic table
+  /ui2/cl_json=>deserialize(
+    EXPORTING
+      json = lv_json
+    CHANGING
+      data = <lt_table> ).
+  IF sy-subrc <> 0.
+    MESSAGE e093(zsap03_msg_cl).
+    RETURN.
+  ENDIF.
+
+  " Consistency check
+  DATA(lv_actual_rows) = lines( <lt_table> ).
+  IF lv_actual_rows <> gs_backup_display-row_count.
+    MESSAGE w094(zsap03_msg_cl) WITH gs_backup_display-row_count lv_actual_rows.
+  ENDIF.
+
+  " Display the restored data in the preview ALV grid
+  CALL METHOD go_alv_prev->set_table_for_first_display
+    EXPORTING
+      i_structure_name = gs_backup_display-tablename
+      is_layout        = VALUE lvc_s_layo( grid_title = |{ TEXT-a25 } { gs_backup_display-version_nr }| )
+    CHANGING
+      it_outtab        = <lt_table>.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form  DELETE_BACKUP_VERSION
+*&---------------------------------------------------------------------*
+*& Deletes the selected backup version from the database.
+*&---------------------------------------------------------------------*
+FORM delete_backup_version.
+  DATA: lt_selected_rows TYPE lvc_t_row,
+        ls_selected_row  TYPE lvc_s_row,
+        lv_backup_id     TYPE sysuuid_c,
+        lv_answer        TYPE c.
+
+  " Get the row(s) selected by the user in the ALV
+  CALL METHOD go_alv_list->get_selected_rows
+    IMPORTING
+      et_index_rows = lt_selected_rows.
+
+  " Check if any row was selected
+  IF lt_selected_rows IS INITIAL.
+    MESSAGE e034(zsap03_msg_cl).
+    RETURN.
+  ENDIF.
+
+  " Confirm with the user before deleting
+  CALL FUNCTION 'POPUP_TO_CONFIRM'
+    EXPORTING
+      titlebar      = TEXT-a19
+      text_question = TEXT-a20
+      text_button_1 = TEXT-a21
+      text_button_2 = TEXT-a22
+    IMPORTING
+      answer        = lv_answer.
+
+  " Proceed only if the user confirms
+  IF lv_answer = '1'.
+    LOOP AT lt_selected_rows INTO ls_selected_row.
+      READ TABLE gt_backup_display INDEX ls_selected_row-index INTO gs_backup_display.
+      IF sy-subrc = 0.
+        lv_backup_id = gs_backup_display-backup_id.
+        " Delete all parts of the backup from the database using the backup_id
+        DELETE FROM zsap03backup_log WHERE backup_id = lv_backup_id.
+        IF sy-subrc = 0.
+          COMMIT WORK AND WAIT.
+          MESSAGE s035(zsap03_msg_cl).
+        ELSE.
+          ROLLBACK WORK.
+          MESSAGE e036(zsap03_msg_cl).
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+    " Refresh the ALV display to reflect the deletion
+    PERFORM display_versions_screen_200.
+  ENDIF.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form  RESTORE_BACKUP
+*&---------------------------------------------------------------------*
+*& Restores the table to a previous state from a selected backup.
+*&---------------------------------------------------------------------*
+FORM restore_backup USING pv_backup_id TYPE sysuuid_c.
+  DATA: lv_xstr_combined TYPE xstring,
+        lv_json_restored TYPE string,
+        lt_data          TYPE REF TO data,
+        lt_backup_parts  TYPE TABLE OF zsap03backup_log.
+  FIELD-SYMBOLS: <lt_table> TYPE ANY TABLE.
+
+  " Select all parts for the given backup ID
+  SELECT * FROM zsap03backup_log INTO TABLE lt_backup_parts
+    WHERE backup_id = pv_backup_id
+    ORDER BY part_no.
+
+  IF sy-subrc <> 0.
+    MESSAGE e040(zsap03_msg_cl).
+    RETURN.
+  ENDIF.
+
+  " Reassemble the complete XSTRING from its parts
+  CLEAR lv_xstr_combined.
+  LOOP AT lt_backup_parts INTO gs_backup.
+    lv_xstr_combined = lv_xstr_combined && gs_backup-line_item.
+  ENDLOOP.
+
+  " Convert XSTRING back to JSON
+  lv_json_restored = cl_abap_codepage=>convert_from( source = lv_xstr_combined codepage = 'UTF-8' ).
+
+  " Read the header information from the first part
+  READ TABLE lt_backup_parts INTO gs_backup INDEX 1.
+  IF sy-subrc <> 0.
+    MESSAGE e089(zsap03_msg_cl).
+    RETURN.
+  ENDIF.
+
+  " Deserialize the JSON data back into a dynamic internal table
+  CREATE DATA lt_data TYPE TABLE OF (gs_backup-tablename).
+  ASSIGN lt_data->* TO <lt_table>.
+  CALL METHOD /ui2/cl_json=>deserialize
+    EXPORTING
+      json = lv_json_restored
+    CHANGING
+      data = <lt_table>.
+
+  " Perform the restore operation: delete current data, then insert backup data
+  DELETE FROM (gs_backup-tablename).
+  INSERT (gs_backup-tablename) FROM TABLE <lt_table> ACCEPTING DUPLICATE KEYS.
+  IF sy-subrc = 0.
+    COMMIT WORK AND WAIT.
+    MESSAGE s037(zsap03_msg_cl).
+    PERFORM refresh_alv_after_restore.
+  ELSE.
+    ROLLBACK WORK.
+    MESSAGE e038(zsap03_msg_cl).
+  ENDIF.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form  RESTORE_BACKUP_WITH_PREBACKUP
+*&---------------------------------------------------------------------*
+*& Creates a backup of the current state before restoring a version.
+*&---------------------------------------------------------------------*
+FORM restore_backup_with_prebackup USING pv_backup_id TYPE sysuuid_c.
+  DATA: lv_last_restored_id TYPE sysuuid_c.
+
+  " Prevent creating a backup if the same version is restored again
+  IF pv_backup_id = lv_last_restored_id.
+    MESSAGE i039(zsap03_msg_cl).
+    PERFORM restore_backup USING pv_backup_id.
+    RETURN.
+  ENDIF.
+
+  " Create a new backup with the reason 'Restore backup'
+  SELECT SINGLE * FROM zsap03backup_log INTO gs_backup WHERE backup_id = pv_backup_id.
+  IF sy-subrc = 0.
+    p_table = gs_backup-tablename.
+    PERFORM create_backup USING TEXT-a23.
+    PERFORM insert_data.
+    PERFORM refresh_alv_after_restore.
+  ELSE.
+    MESSAGE e040(zsap03_msg_cl).
+  ENDIF.
+
+  " Proceed with the actual restore
+  PERFORM restore_backup USING pv_backup_id.
+  lv_last_restored_id = pv_backup_id.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form  REFRESH_ALV_AFTER_RESTORE
+*&---------------------------------------------------------------------*
+*& Refreshes the main data ALV after a restore operation.
+*&---------------------------------------------------------------------*
+FORM refresh_alv_after_restore.
+  " Reload data and re-prepare the ALV grid structures
+  PERFORM load_table_data.
+  PERFORM prepare_alv_structure.
+  PERFORM update_fcat_protection.
+  PERFORM set_color.
+  PERFORM set_cell_styles.
+  PERFORM filter_and_refresh_alv.
+  " Reset save state after restore
+  PERFORM reset_save_state.
+  " Refresh the ALV display on the frontend
+  IF go_grid IS BOUND.
+    CALL METHOD go_grid->refresh_table_display
+      EXPORTING
+        is_stable = VALUE #( row = abap_true col = abap_true ).
+  ENDIF.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form check_primary_key_validation
+*&---------------------------------------------------------------------*
+*& Apply different validation logic based on number of primary keys
+*& - Single PK: Mandatory (cannot be empty)
+*& - Composite PK: Optional (all can be empty)
+*&---------------------------------------------------------------------*
+FORM check_primary_key_validation
+  USING ps_table_line TYPE any
+        pv_row_index TYPE i
+  CHANGING cv_key_empty TYPE abap_bool
+           cv_error_msg TYPE string.
+
+  DATA: lt_pk_fields TYPE TABLE OF dd03l,
+        lv_pk_count  TYPE i,
+        lv_empty_count TYPE i VALUE 0.
+
+  " Initialize return values
+  cv_key_empty = abap_false.
+  CLEAR cv_error_msg.
+
+  " Get primary key fields (excluding MANDT)
+  LOOP AT gt_fieldcat INTO DATA(ls_fcat) WHERE key = abap_true AND fieldname <> 'MANDT'.
+    APPEND VALUE dd03l( fieldname = ls_fcat-fieldname ) TO lt_pk_fields.
+  ENDLOOP.
+
+  lv_pk_count = lines( lt_pk_fields ).
+
+  " If no primary keys found, skip validation
+  IF lv_pk_count = 0.
+    RETURN.
+  ENDIF.
+
+  " Check each primary key field
+  LOOP AT lt_pk_fields INTO DATA(ls_pk_field).
+    ASSIGN COMPONENT ls_pk_field-fieldname OF STRUCTURE ps_table_line TO FIELD-SYMBOL(<lv_pk_value>).
+    IF <lv_pk_value> IS ASSIGNED AND <lv_pk_value> IS INITIAL.
+      lv_empty_count = lv_empty_count + 1.
+    ENDIF.
+  ENDLOOP.
+
+  " Apply different validation logic based on primary key count
+  CASE lv_pk_count.
+    WHEN 1.
+      " **Single Primary Key: MANDATORY (cannot be empty)**
+      IF lv_empty_count > 0.
+        cv_key_empty = abap_true.
+        READ TABLE lt_pk_fields INTO ls_pk_field INDEX 1.
+        cv_error_msg = |Row { pv_row_index }: Field { ls_pk_field-fieldname } is mandatory (single primary key)|.
+      ENDIF.
+
+    WHEN OTHERS.
+      " **Composite Primary Key: OPTIONAL (all can be empty)**
+      " No validation - allow all fields to be empty
+      cv_key_empty = abap_false.
+      " Note: Duplicate check will still apply for non-empty combinations
+  ENDCASE.
+ENDFORM.

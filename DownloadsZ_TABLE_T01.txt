@@ -1,0 +1,140 @@
+CLASS zcl_table_manager DEFINITION.
+  PUBLIC SECTION.
+    METHODS:
+      constructor,
+      get_table_structure
+        IMPORTING iv_tabname     TYPE tabname
+        RETURNING VALUE(rt_fcat) TYPE lvc_t_fcat,
+
+      get_table_data
+        IMPORTING iv_tabname     TYPE tabname
+        RETURNING VALUE(rr_data) TYPE REF TO data,
+
+      update_table_data
+        IMPORTING iv_tabname        TYPE tabname
+                  ir_data           TYPE REF TO data
+        RETURNING VALUE(rv_success) TYPE abap_bool,
+
+      delete_table_data
+        IMPORTING iv_tabname        TYPE tabname
+                  it_keys           TYPE lvc_t_row
+                  ir_data           TYPE REF TO data
+        RETURNING VALUE(rv_success) TYPE abap_bool,
+
+      create_table_data
+        IMPORTING iv_tabname        TYPE tabname
+                  ir_data           TYPE REF TO data
+        RETURNING VALUE(rv_success) TYPE abap_bool.
+ENDCLASS.
+
+CLASS zcl_table_event_handler DEFINITION.
+  PUBLIC SECTION.
+    METHODS:
+      handle_toolbar FOR EVENT toolbar OF cl_gui_alv_grid
+        IMPORTING e_object e_interactive,
+
+      handle_user_command FOR EVENT user_command OF cl_gui_alv_grid
+        IMPORTING e_ucomm,
+
+      handle_data_changed FOR EVENT data_changed OF cl_gui_alv_grid
+        IMPORTING er_data_changed,
+
+      check_key_duplicate
+        IMPORTING
+          iv_row_id TYPE i
+          it_mod_values TYPE lvc_t_modi
+          it_key_fcat TYPE lvc_t_fcat
+        RETURNING
+          VALUE(rv_is_duplicate) TYPE abap_bool,
+
+      revalidate_all_new_rows.
+ENDCLASS.
+
+CONSTANTS:
+  c_mode_display TYPE i VALUE 1,
+  c_mode_edit    TYPE i VALUE 2,
+  c_mode_create  TYPE i VALUE 3,
+  " Add new constants for better state management
+  c_save_state_clean    TYPE c VALUE 'C',
+  c_save_state_pending  TYPE c VALUE 'P',
+  c_save_state_declined TYPE c VALUE 'D'.
+
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE TEXT-001.
+  PARAMETERS:
+    p_table TYPE tabname OBLIGATORY LOWER CASE
+            MEMORY ID ztb.
+SELECTION-SCREEN END OF BLOCK b1.
+
+TYPES:
+  BEGIN OF gty_dynamic_line,
+    zis_new    TYPE abap_bool,
+    zis_error  TYPE abap_bool,
+    zrow_color TYPE c LENGTH 4,
+    zcelltab   TYPE lvc_t_styl,
+  END OF gty_dynamic_line.
+
+TYPES: BEGIN OF gty_save_result,
+         success_count      TYPE i,
+         error_count        TYPE i,
+         delete_count       TYPE i,
+         delete_error_count TYPE i,
+         need_commit        TYPE abap_bool,
+         error_messages     TYPE string,
+       END OF gty_save_result.
+
+TYPES: gty_success_flags TYPE TABLE OF abap_bool.
+
+TYPES: BEGIN OF gty_backup_display,
+         backup_id           TYPE sysuuid_c,
+         userid              TYPE syuname,
+         formatted_timestamp TYPE c LENGTH 19,
+         version_nr          TYPE numc4,
+         row_count           TYPE int4,
+         reason              TYPE zreason,
+         tablename           TYPE tabname,
+         line_item           TYPE xstring,
+       END OF gty_backup_display.
+
+DATA:
+  go_tab_mgr           TYPE REF TO zcl_table_manager,
+  go_evt_hdlr          TYPE REF TO zcl_table_event_handler,
+  go_grid              TYPE REF TO cl_gui_alv_grid,
+  go_cont              TYPE REF TO cl_gui_custom_container,
+  gt_table_data        TYPE REF TO data,
+  gt_alv_data          TYPE REF TO data,
+  gt_deleted_data      TYPE REF TO data,
+  gt_alv_snapshot      TYPE REF TO data,
+  gt_fieldcat          TYPE lvc_t_fcat,
+  gs_layout            TYPE lvc_s_layo,
+  gv_mode              TYPE i,
+  gv_data_changed      TYPE abap_bool,
+  gv_okcode            TYPE sy-ucomm,
+  gt_exclude           TYPE ui_functions,
+  gt_rows              TYPE lvc_t_row,
+  gv_has_data          TYPE abap_bool,
+  gv_refresh_needed    TYPE abap_bool,
+  gv_title_updated     TYPE abap_bool,
+  gt_pk_cache          TYPE TABLE OF dd03l,
+  gv_skip_save_confirm TYPE abap_bool VALUE abap_false,
+  gv_save_declined     TYPE abap_bool VALUE abap_false,
+  " Add new variable for better state management
+  gv_save_state        TYPE c VALUE 'C',
+  go_splitter          TYPE REF TO cl_gui_splitter_container,
+  go_cont_list         TYPE REF TO cl_gui_container,
+  go_cont_prev         TYPE REF TO cl_gui_container,
+  go_alv_list          TYPE REF TO cl_gui_alv_grid,
+  go_alv_prev          TYPE REF TO cl_gui_alv_grid,
+  gt_backup            TYPE TABLE OF zsap03backup_log,
+  gs_backup            TYPE zsap03backup_log,
+  gt_backup_display    TYPE TABLE OF gty_backup_display,  " For ALV display
+  gs_backup_display    TYPE gty_backup_display,
+  gv_reason            TYPE zreason,
+  gv_selected_id       TYPE sysuuid_c,
+  gt_added_rows     TYPE TABLE OF i,
+  gt_modified_rows  TYPE TABLE OF i,
+  gt_deleted_rows   TYPE TABLE OF string.
+
+FIELD-SYMBOLS:
+  <gt_data>     TYPE ANY TABLE,
+  <gt_alv_data> TYPE ANY TABLE,
+  <gs_line>     TYPE any.

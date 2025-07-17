@@ -1,0 +1,164 @@
+*&---------------------------------------------------------------------*
+*& Include         YSAP03_DYNAMIC_Z_TABLE_F00
+*&---------------------------------------------------------------------*
+
+FORM create_alv_container.
+  "*--------------------------------------------------------------------*
+  "* Form này tạo container và grid cho ALV
+  "* - Tạo custom container để chứa ALV grid
+  "* - Tạo ALV grid object
+  "* - Đăng ký các event handler
+  "*--------------------------------------------------------------------*
+  CHECK go_cont IS INITIAL.
+
+  " Tạo container và grid
+  CREATE OBJECT go_cont EXPORTING container_name = 'ALV_CONT'.
+  CREATE OBJECT go_grid EXPORTING i_parent = go_cont.
+
+  " Đăng ký các event handler để xử lý sự kiện
+  SET HANDLER:
+    go_evt_hdlr->handle_toolbar      FOR go_grid,  "Xử lý toolbar
+    go_evt_hdlr->handle_user_command FOR go_grid,  "Xử lý user command
+    go_evt_hdlr->handle_data_changed FOR go_grid.  "Xử lý data changed
+
+  " Đăng ký sự kiện thay đổi dữ liệu để bảo vệ khóa chính
+  CALL METHOD go_grid->register_edit_event
+    EXPORTING
+      i_event_id = cl_gui_alv_grid=>mc_evt_modified.
+ENDFORM.
+
+FORM set_alv_layout.
+  "*--------------------------------------------------------------------*
+  "* Form này thiết lập layout cho ALV Grid
+  "* - Thiết lập các thuộc tính hiển thị
+  "* - Thiết lập chế độ chọn dòng
+  "* - Thiết lập tiêu đề với số dòng hiện tại
+  "*--------------------------------------------------------------------*
+  CLEAR gs_layout.
+
+  " Thiết lập layout cơ bản
+  gs_layout-zebra = abap_true.        "Hiển thị dòng kẻ sọc
+  gs_layout-sel_mode = 'A'.           "Cho phép chọn nhiều dòng
+  gs_layout-cwidth_opt = abap_true.   "Tự động điều chỉnh độ rộng cột
+  gs_layout-no_rowins = abap_true.    "Không cho phép thêm dòng trực tiếp
+  gs_layout-stylefname = 'CELLTAB'.   "Tên trường chứa cell styles
+  gs_layout-info_fname = 'ROW_COLOR'. "Tên trường chứa màu sắc dòng
+
+  " Cập nhật tiêu đề với số dòng hiện tại
+  PERFORM update_alv_title.
+ENDFORM.
+
+FORM display_alv.
+  "*--------------------------------------------------------------------*
+  "* Form này hiển thị ALV Grid
+  "* - Thiết lập container và layout
+  "* - Áp dụng cell styles
+  "* - Hiển thị dữ liệu
+  "*--------------------------------------------------------------------*
+  FIELD-SYMBOLS: <lt_alv_table> TYPE table.
+
+  " Thiết lập các thành phần ALV
+  PERFORM create_alv_container.
+  PERFORM set_alv_layout.
+
+  " Lấy bảng dữ liệu ALV
+  ASSIGN gt_alv_data->* TO <lt_alv_table>.
+  CHECK go_grid IS BOUND AND <lt_alv_table> IS ASSIGNED.
+
+  " Áp dụng màu sắc và cell styles
+  PERFORM set_color.
+  PERFORM set_cell_styles.
+
+  " Hiển thị ALV table với các thiết lập
+  CALL METHOD go_grid->set_table_for_first_display
+    EXPORTING
+      is_layout            = gs_layout              "Layout đã thiết lập
+      it_toolbar_excluding = gt_exclude   "Các nút bị ẩn
+      i_save               = 'A'                       "Lưu layout
+    CHANGING
+      it_outtab            = <lt_alv_table>        "Bảng dữ liệu
+      it_fieldcatalog      = gt_fieldcat.     "Field catalog
+ENDFORM.
+
+FORM update_alv_title.
+  "*--------------------------------------------------------------------*
+  "* Form này cập nhật tiêu đề ALV với số dòng hiện tại
+  "* - Đếm số dòng hiệu lực (không bị đánh dấu xóa)
+  "* - Cập nhật grid_title với thông tin số dòng
+  "*--------------------------------------------------------------------*
+  " Kiểm tra flag để tránh update không cần thiết
+  CHECK gv_title_updated = abap_false.
+
+  FIELD-SYMBOLS: <lt_alv_data> TYPE ANY TABLE,
+                 <ls_alv_line> TYPE any.
+
+  DATA: lv_active_rows  TYPE i,
+        lv_new_rows     TYPE i,
+        lv_deleted_rows TYPE i.
+
+  " Gán ALV data
+  ASSIGN gt_alv_data->* TO <lt_alv_data>.
+  IF <lt_alv_data> IS NOT ASSIGNED.
+    gs_layout-grid_title = |Table data { p_table }|.
+    RETURN.
+  ENDIF.
+
+  " Đếm các loại dòng trong một loop duy nhất
+  LOOP AT <lt_alv_data> ASSIGNING <ls_alv_line>.
+    ASSIGN COMPONENT 'IS_DELETED' OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_is_deleted>).
+    ASSIGN COMPONENT 'IS_NEW' OF STRUCTURE <ls_alv_line> TO FIELD-SYMBOL(<lv_is_new>).
+
+    IF <lv_is_deleted> IS ASSIGNED AND <lv_is_deleted> = 'X'.
+      lv_deleted_rows = lv_deleted_rows + 1.
+    ELSEIF <lv_is_new> IS ASSIGNED AND <lv_is_new> = 'X'.
+      lv_new_rows = lv_new_rows + 1.
+      lv_active_rows = lv_active_rows + 1.
+    ELSE.
+      lv_active_rows = lv_active_rows + 1.
+    ENDIF.
+  ENDLOOP.
+
+  " Tạo tiêu đề đơn giản hóa
+  gs_layout-grid_title = |Table data { p_table } - { lv_active_rows } rows|.
+
+  " Thêm thông tin chi tiết nếu cần
+  IF lv_new_rows > 0.
+    gs_layout-grid_title = |{ gs_layout-grid_title } ({ lv_new_rows } new)|.
+  ENDIF.
+
+  IF lv_deleted_rows > 0.
+    gs_layout-grid_title = |{ gs_layout-grid_title } ({ lv_deleted_rows } deleted)|.
+  ENDIF.
+
+  " Đánh dấu đã update
+  gv_title_updated = abap_true.
+ENDFORM.
+
+FORM optimized_alv_refresh.
+  "*--------------------------------------------------------------------*
+  "* Form tối ưu để refresh ALV - gộp tất cả update trong một lần
+  "* - Kiểm tra flag để tránh refresh không cần thiết
+  "* - Gộp update title, color, cell styles
+  "*--------------------------------------------------------------------*
+  CHECK go_grid IS BOUND AND gv_refresh_needed = abap_true.
+
+  " Reset flags
+  gv_title_updated = abap_false.
+
+  " Update tất cả trong một chuỗi
+  PERFORM update_alv_title.
+  PERFORM set_color.
+  PERFORM set_cell_styles.
+
+  " Apply changes một lần duy nhất
+  CALL METHOD go_grid->set_frontend_layout
+    EXPORTING
+      is_layout = gs_layout.
+
+  CALL METHOD go_grid->refresh_table_display
+    EXPORTING
+      is_stable = VALUE #( row = abap_true col = abap_true ).
+
+  " Reset flag
+  gv_refresh_needed = abap_false.
+ENDFORM.

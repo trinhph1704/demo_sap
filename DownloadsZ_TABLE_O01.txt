@@ -1,0 +1,36 @@
+*&---------------------------------------------------------------------*
+*& Include          YSAP03_DYNAMIC_Z_TABLE_O01
+*&---------------------------------------------------------------------*
+
+MODULE status_0100 OUTPUT.
+  DATA: lv_title TYPE string.
+
+  CONCATENATE 'Table' p_table INTO lv_title SEPARATED BY space.
+
+  CASE gv_mode.
+    WHEN c_mode_display.
+      CONCATENATE lv_title '(View Mode)' INTO lv_title SEPARATED BY space.
+    WHEN c_mode_edit OR c_mode_create.
+      CONCATENATE lv_title '(Edit Mode)' INTO lv_title SEPARATED BY space.
+  ENDCASE.
+
+  SET TITLEBAR 'T001'.
+  SET PF-STATUS 'S001'.
+
+  IF go_cont IS INITIAL.
+    PERFORM create_alv_container.
+    PERFORM display_alv.
+  ENDIF.
+
+  " Only refresh ALV if data changed flag is set, but don't reset the flag automatically
+  " The flag should only be reset when data is actually saved or user confirms to discard changes
+  IF gv_data_changed = abap_true.
+    PERFORM filter_and_refresh_alv.
+  ENDIF.
+ENDMODULE.
+
+MODULE status_0200 OUTPUT.
+  SET PF-STATUS 'S002'.
+  SET TITLEBAR 'T002'.
+  PERFORM display_versions_screen_200.
+ENDMODULE.

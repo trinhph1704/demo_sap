@@ -1,0 +1,50 @@
+*&---------------------------------------------------------------------*
+*& Include          YSAP03_DYNAMIC_Z_TABLE_I01
+*&---------------------------------------------------------------------*
+
+MODULE user_command_0100 INPUT.
+  gv_okcode = sy-ucomm.
+
+  CASE gv_okcode.
+    WHEN 'EDIT'.   PERFORM enter_edit_mode.
+    WHEN 'CREATE'. PERFORM enter_create_mode.
+    WHEN 'SAVE'.   PERFORM save_data.
+    WHEN 'DELETE'. PERFORM delete_data.
+    WHEN 'BACK' OR 'CANCEL' OR 'EXIT'.
+      PERFORM confirm_before_exit.
+    WHEN 'SETTING'. PERFORM set_mail.
+  ENDCASE.
+
+  CLEAR gv_okcode.
+ENDMODULE.
+
+MODULE user_command_0200 INPUT.
+  gv_okcode = sy-ucomm.
+  CASE gv_okcode.
+    WHEN 'RESTORE'.
+      IF gv_selected_id IS INITIAL.
+        MESSAGE e042(ZSAP03_MSG_CL).
+      ELSE.
+        PERFORM restore_backup_with_prebackup USING gv_selected_id.
+        PERFORM refresh_alv_after_restore.
+        LEAVE TO SCREEN 0.
+      ENDIF.
+    WHEN 'DELETE_BACKUP'.
+      PERFORM delete_backup_version.
+    WHEN 'BACK' OR 'CANCEL' OR 'EXIT'.
+      IF go_alv_list IS BOUND.
+        go_alv_list->free( ).
+        FREE go_alv_list.
+      ENDIF.
+      IF go_alv_prev IS BOUND.
+        go_alv_prev->free( ).
+        FREE go_alv_prev.
+      ENDIF.
+      IF go_splitter IS BOUND.
+        go_splitter->free( ).
+        FREE go_splitter.
+      ENDIF.
+      LEAVE TO SCREEN 0.
+  ENDCASE.
+  CLEAR gv_okcode.
+ENDMODULE.
